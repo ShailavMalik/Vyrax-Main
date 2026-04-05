@@ -115,6 +115,8 @@ def draw_results(frame: np.ndarray, result: Dict[str, Any], fps: float) -> None:
     smoothed_emotion = str(result.get("smoothed_emotion", STATUS_UNCERTAIN))
     smoothed_confidence = float(result.get("smoothed_confidence", 0.0))
     status = str(result.get("status", STATUS_TRACKING))
+    iot_emotion = str(result.get("iot_emotion", final_emotion))
+    iot_hold_remaining = float(result.get("iot_hold_remaining", 0.0))
 
     color = EMOTION_COLORS.get(final_emotion, DEFAULT_EMOTION_COLOR)
 
@@ -140,6 +142,7 @@ def draw_results(frame: np.ndarray, result: Dict[str, Any], fps: float) -> None:
         f"Raw: {raw_emotion.upper()} {raw_confidence * 100:.0f}%",
         f"Smoothed: {smoothed_emotion.upper()} {smoothed_confidence * 100:.0f}%",
         f"Final: {final_emotion.upper()} {final_confidence * 100:.0f}%",
+        f"IoT: {iot_emotion.upper()} hold {iot_hold_remaining:.1f}s",
     ]
 
     triggers = result.get("rule_triggers") or []
@@ -436,6 +439,9 @@ class EmotionDetectionPipeline:
             "smoothed_confidence": float(intelligence["smoothed_confidence"]),
             "final_emotion": intelligence["final_emotion"],
             "final_confidence": float(intelligence["final_confidence"]),
+            "iot_emotion": intelligence.get("iot_emotion", intelligence["final_emotion"]),
+            "iot_hold_remaining": float(intelligence.get("iot_hold_remaining", 0.0)),
+            "iot_transition_decision": intelligence.get("iot_transition_decision", "n/a"),
             "rule_triggers": intelligence.get("rule_triggers", []),
             "scores": intelligence.get("scores", {}),
             "features": features,
@@ -465,6 +471,8 @@ class EmotionDetectionPipeline:
                     "rule_triggers": result["rule_triggers"],
                     "final_emotion": result["final_emotion"],
                     "final_confidence": result["final_confidence"],
+                    "iot_emotion": result.get("iot_emotion"),
+                    "iot_hold_remaining": result.get("iot_hold_remaining"),
                     "fps": self.state.fps,
                     "movement_trigger": result["movement_trigger"],
                     "landmark_trigger": result["landmark_trigger"],

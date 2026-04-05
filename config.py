@@ -16,7 +16,7 @@ FACE_MOVEMENT_THRESHOLD_PX = 18.0
 LANDMARK_CHANGE_THRESHOLD = 0.07
 
 # Face detection and crop
-MIN_FACE_SIZE = 50
+MIN_FACE_SIZE = 20
 MAX_FACES_PROCESS = 1
 FACE_PADDING = 18
 FACE_CROP_SIZE = (128, 128)
@@ -25,10 +25,23 @@ FACE_CROP_SIZE = (128, 128)
 SUPPORTED_EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 SMOOTHING_WINDOW_SIZE = 8
 MIN_CONFIDENCE_THRESHOLD = 0.12
+LOW_CONFIDENCE_GAP_THRESHOLD = 0.08
 TRANSITION_MARGIN = 0.09
+TRANSITION_COOLDOWN_SECONDS = 0.35
 EMOTION_HOLD_SECONDS = 2.0
 HOLD_SWITCH_MARGIN = 0.20
+HOLD_OVERRIDE_MARGIN = 0.26
 FEATURE_BASELINE_ALPHA = 0.92
+USE_EMA_SMOOTHING = True
+EMA_ALPHA = 0.40
+
+# IoT actuation stabilization (separate from on-screen label stability).
+IOT_ACTUATION_ENABLED = True
+IOT_ACTUATION_HOLD_SECONDS = 3.0
+IOT_MIN_CONFIDENCE = 0.42
+IOT_CONFIRM_STREAK = 2
+IOT_OVERRIDE_MARGIN = 0.18
+IOT_BLOCK_UNCERTAIN = True
 
 # Box stabilization controls (reduce rectangle flicker/jitter).
 BOX_SMOOTHING_ALPHA = 0.78
@@ -36,13 +49,13 @@ BOX_HOLD_MISSING_SECONDS = 0.22
 
 # Rare-emotion weighting and confidence calibration
 EMOTION_WEIGHTS = {
-    "happy": 1.06,
+    "happy": 1.02,
     "sad": 1.08,
-    "angry": 1.12,
-    "surprise": 1.08,
+    "angry": 1.20,
+    "surprise": 1.30,
     "fear": 1.08,
-    "disgust": 1.20,
-    "neutral": 0.96,
+    "disgust": 1.40,
+    "neutral": 0.90,
 }
 CONFIDENCE_CALIBRATION_POWER = 0.92
 LOW_QUALITY_NON_NEUTRAL_PENALTY = 0.65

@@ -37,7 +37,7 @@ import math
 import os
 import urllib.request
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, cast
 
@@ -63,6 +63,7 @@ except Exception:  # pragma: no cover
 
 from config import (
     CONFIDENCE_CALIBRATION_POWER,
+    EMA_ALPHA,
     EMOTION_HOLD_SECONDS,
     EMOTION_WEIGHTS,
     EYE_NARROW_THRESHOLD,
@@ -76,9 +77,16 @@ from config import (
     HOLD_SWITCH_MARGIN,
     HOLD_ESCAPE_STRONG_HAPPY,
     HOLD_ESCAPE_STRONG_SURPRISE,
+    IOT_ACTUATION_ENABLED,
+    IOT_ACTUATION_HOLD_SECONDS,
+    IOT_BLOCK_UNCERTAIN,
+    IOT_CONFIRM_STREAK,
+    IOT_MIN_CONFIDENCE,
+    IOT_OVERRIDE_MARGIN,
     LANDMARK_CHANGE_THRESHOLD,
     LOW_QUALITY_NEUTRAL_BOOST,
     LOW_QUALITY_NON_NEUTRAL_PENALTY,
+    LOW_CONFIDENCE_GAP_THRESHOLD,
     MAX_FACES_PROCESS,
     MIN_CONFIDENCE_THRESHOLD,
     MIN_FACE_SIZE,
@@ -101,6 +109,9 @@ from config import (
     SURPRISE_MOUTH_BOOST_THRESHOLD,
     SUPPORTED_EMOTIONS,
     TRANSITION_MARGIN,
+    TRANSITION_COOLDOWN_SECONDS,
+    HOLD_OVERRIDE_MARGIN,
+    USE_EMA_SMOOTHING,
 )
 from utils import clamp_box
 
@@ -141,6 +152,80 @@ class DetectionCache:
     last_landmark_signature: Optional[Tuple[float, float, float, float]] = None
 
 
+@dataclass
+class EmotionEngineConfig:
+    """Configuration bundle for the intelligence layer."""
+
+    supported_emotions: Tuple[str, ...] = tuple(SUPPORTED_EMOTIONS)
+    confidence_calibration_power: float = CONFIDENCE_CALIBRATION_POWER
+    emotion_weights: Dict[str, float] = field(default_factory=lambda: dict(EMOTION_WEIGHTS))
+
+    min_confidence_threshold: float = MIN_CONFIDENCE_THRESHOLD
+    confidence_gap_threshold: float = LOW_CONFIDENCE_GAP_THRESHOLD
+
+    smoothing_window_size: int = SMOOTHING_WINDOW_SIZE
+    use_ema_smoothing: bool = USE_EMA_SMOOTHING
+    ema_alpha: float = EMA_ALPHA
+
+    transition_margin: float = TRANSITION_MARGIN
+    transition_cooldown_seconds: float = TRANSITION_COOLDOWN_SECONDS
+
+    hold_seconds: float = EMOTION_HOLD_SECONDS
+    hold_switch_margin: float = HOLD_SWITCH_MARGIN
+    hold_override_margin: float = HOLD_OVERRIDE_MARGIN
+
+    raw_override_confidence: float = RAW_OVERRIDE_CONFIDENCE
+    raw_override_margin: float = RAW_OVERRIDE_MARGIN
+    raw_override_streak: int = RAW_OVERRIDE_STREAK
+
+    iot_actuation_enabled: bool = IOT_ACTUATION_ENABLED
+    iot_actuation_hold_seconds: float = IOT_ACTUATION_HOLD_SECONDS
+    iot_min_confidence: float = IOT_MIN_CONFIDENCE
+    iot_confirm_streak: int = IOT_CONFIRM_STREAK
+    iot_override_margin: float = IOT_OVERRIDE_MARGIN
+    iot_block_uncertain: bool = IOT_BLOCK_UNCERTAIN
+
+
+@dataclass
+class LowConfidenceResult:
+    filtered_scores: Dict[str, float]
+    status: str
+    reason: str
+    uncertain: bool
+
+
+@dataclass
+class ProcessEmotionResult:
+    raw_scores: Dict[str, float]
+    calibrated_scores: Dict[str, float]
+    weighted_scores: Dict[str, float]
+    rule_adjusted_scores: Dict[str, float]
+    smoothed_scores: Dict[str, float]
+
+    raw_top_emotion: Optional[str]
+    raw_top_confidence: float
+    smoothed_top_emotion: Optional[str]
+    smoothed_top_confidence: float
+
+    final_emotion: str
+    final_confidence: float
+    iot_emotion: str
+    iot_hold_remaining: float
+    iot_transition_decision: str
+
+    triggered_rules: List[str]
+    hold_active: bool
+    hold_remaining: float
+    transition_decision: str
+
+    uncertain: bool
+    status: str
+    debug_reason: str
+
+    low_confidence_reason: str
+    filtered_scores: Dict[str, float]
+
+
 class EmotionHistory:
     """Legacy rolling history container kept for compatibility with old callers."""
 
@@ -168,80 +253,268 @@ class EmotionIntelligenceEngine:
         hold_seconds: float = EMOTION_HOLD_SECONDS,
         transition_margin: float = TRANSITION_MARGIN,
         hold_switch_margin: float = HOLD_SWITCH_MARGIN,
+        config: Optional[EmotionEngineConfig] = None,
     ) -> None:
-        self.window_size = max(5, min(10, int(window_size)))
+        self.config = config or EmotionEngineConfig()
+        self.window_size = max(5, min(10, int(window_size or self.config.smoothing_window_size)))
         self.buffer: Deque[Dict[str, float]] = deque(maxlen=self.window_size)
-        self.hold_seconds = float(hold_seconds)
-        self.transition_margin = float(transition_margin)
-        self.hold_switch_margin = float(hold_switch_margin)
+        self.hold_seconds = float(hold_seconds or self.config.hold_seconds)
+        self.transition_margin = float(transition_margin or self.config.transition_margin)
+        self.hold_switch_margin = float(hold_switch_margin or self.config.hold_switch_margin)
+
         self.current_emotion: Optional[str] = None
         self.current_confidence: float = 0.0
         self.hold_until: float = 0.0
+
         self.feature_baseline: Optional[Dict[str, float]] = None
+
         self.candidate_streak_emotion: Optional[str] = None
         self.candidate_streak_count: int = 0
+
         self.raw_streak_emotion: Optional[str] = None
         self.raw_streak_count: int = 0
 
-    def evaluate(self, raw_scores: Dict[str, float], features: Dict[str, Any], now_ts: float, face_quality: float = 1.0) -> Dict[str, Any]:
-        # Step 1: normalize score confidence shape (soft calibration).
-        calibrated = self._calibrate_scores(raw_scores)
-        # Step 2: down-weight unstable non-neutral outcomes on poor quality frames.
-        quality_adjusted = self._apply_face_quality(calibrated, face_quality)
-        # Step 3: maintain per-user geometric baseline for adaptive thresholds.
-        baseline = self._update_feature_baseline(features)
-        # Step 4: apply class priors to help under-represented emotions.
-        weighted = self._apply_weights(quality_adjusted)
-        # Step 5: apply deterministic FaceMesh rules.
-        corrected_scores, triggers = apply_facial_rules(weighted, features, baseline=baseline)
-        # Step 6: apply temporal smoothing across recent frames.
-        smoothed_scores = self._smooth(corrected_scores)
+        self.last_transition_ts: float = 0.0
+        self.ema_scores: Optional[Dict[str, float]] = None
 
-        raw_emotion, raw_conf = pick_top(raw_scores)
-        # Build candidate from blended maps so smoothing does not fully suppress
-        # fresh evidence from the current frame.
-        candidate_scores = self._blend_candidate_scores(
-            raw_calibrated=quality_adjusted,
-            corrected=corrected_scores,
-            smoothed=smoothed_scores,
+        self.iot_emotion: str = "neutral"
+        self.iot_hold_until: float = 0.0
+        self.iot_candidate_emotion: Optional[str] = None
+        self.iot_candidate_count: int = 0
+
+    def process_emotion_signal(
+        self,
+        fer_scores: Dict[str, float],
+        landmarks: Dict[str, Any],
+        current_state: Optional[Dict[str, Any]],
+        timestamp: float,
+        movement_metrics: Optional[Dict[str, Any]] = None,
+        face_quality: float = 1.0,
+    ) -> ProcessEmotionResult:
+        """Run full intelligence pipeline and return rich debug-friendly output."""
+        if not fer_scores:
+            return ProcessEmotionResult(
+                raw_scores={},
+                calibrated_scores={},
+                weighted_scores={},
+                rule_adjusted_scores={},
+                smoothed_scores={},
+                raw_top_emotion=None,
+                raw_top_confidence=0.0,
+                smoothed_top_emotion=None,
+                smoothed_top_confidence=0.0,
+                final_emotion="uncertain",
+                final_confidence=0.0,
+                iot_emotion=self.iot_emotion,
+                iot_hold_remaining=max(0.0, self.iot_hold_until - timestamp),
+                iot_transition_decision="no_signal",
+                triggered_rules=[],
+                hold_active=timestamp < self.hold_until,
+                hold_remaining=max(0.0, self.hold_until - timestamp),
+                transition_decision="no_signal",
+                uncertain=True,
+                status="uncertain",
+                debug_reason="empty_fer_scores",
+                low_confidence_reason="empty_fer_scores",
+                filtered_scores={},
+            )
+
+        raw_scores = normalize_scores(fer_scores)
+        calibrated = self._calibrate_scores(raw_scores)
+        quality_adjusted = self._apply_face_quality(calibrated, face_quality)
+
+        low_conf = self._low_confidence_filter(quality_adjusted)
+        filtered = low_conf.filtered_scores
+
+        weighted = self._apply_weights(filtered)
+        baseline = self._update_feature_baseline(landmarks)
+        rule_adjusted, rules = apply_facial_rules(weighted, landmarks, baseline=baseline)
+        smoothed = self._smooth(rule_adjusted)
+
+        raw_top_emotion, raw_top_conf = pick_top(raw_scores)
+        smoothed_top_emotion, smoothed_top_conf = pick_top(smoothed)
+        candidate_emotion, candidate_conf = self._select_candidate(smoothed, rule_adjusted, raw_scores)
+
+        candidate_emotion, candidate_conf, transition_decision = self._transition_control(
+            candidate_emotion=candidate_emotion,
+            candidate_conf=candidate_conf,
+            smoothed_scores=smoothed,
+            now_ts=timestamp,
         )
 
-        smoothed_emotion, smoothed_conf = pick_top(smoothed_scores)
-        candidate_emotion, candidate_conf = pick_top(candidate_scores)
+        final_emotion, final_conf, hold_active, hold_remaining = self._apply_hold(
+            candidate_emotion=candidate_emotion,
+            candidate_conf=candidate_conf,
+            now_ts=timestamp,
+            smoothed_scores=smoothed,
+        )
 
-        # Step 7: prevent sudden transitions unless the new emotion is clearly stronger.
-        candidate_emotion, candidate_conf = self._transition_control(candidate_emotion, candidate_conf, smoothed_scores)
-        # Step 8: emotion hold lock for visual stability in live demos.
-        final_emotion, final_conf = self._apply_hold(candidate_emotion, candidate_conf, now_ts, smoothed_scores)
-
-        # Step 9: if raw FER is repeatedly and strongly confident, allow override.
         final_emotion, final_conf, raw_override = self._raw_confidence_override(
-            raw_emotion=raw_emotion,
-            raw_conf=raw_conf,
+            raw_emotion=raw_top_emotion,
+            raw_conf=raw_top_conf,
             final_emotion=final_emotion,
             final_conf=final_conf,
         )
         if raw_override:
-            triggers.append("raw_confidence_override")
+            rules.append("raw_confidence_override")
+            transition_decision = "raw_override"
 
-        return {
-            "raw_emotion": raw_emotion,
-            "raw_confidence": raw_conf,
-            "smoothed_emotion": smoothed_emotion,
-            "smoothed_confidence": smoothed_conf,
-            "final_emotion": final_emotion,
-            "final_confidence": final_conf,
-            "rule_triggers": triggers,
-            "scores": raw_scores,
-            "calibrated_scores": calibrated,
-            "quality_adjusted_scores": quality_adjusted,
-            "weighted_scores": corrected_scores,
-            "smoothed_scores": smoothed_scores,
-            "candidate_scores": candidate_scores,
-            "hold_remaining": max(0.0, self.hold_until - now_ts),
-            "face_quality": face_quality,
-            "feature_baseline": baseline,
-        }
+        uncertain = low_conf.uncertain and final_conf < self.config.min_confidence_threshold
+        debug_reason = low_conf.reason
+        status = "ok"
+        if uncertain:
+            status = "uncertain"
+            debug_reason = low_conf.reason
+
+        if current_state and current_state.get("force_uncertain"):
+            uncertain = True
+            status = "uncertain"
+            debug_reason = "forced_by_state"
+
+        if movement_metrics:
+            # Lightweight debug channel so caller can inspect scheduling context.
+            if movement_metrics.get("time_trigger"):
+                rules.append("time_trigger")
+            if movement_metrics.get("movement_trigger"):
+                rules.append("movement_trigger")
+            if movement_metrics.get("landmark_trigger"):
+                rules.append("landmark_trigger")
+
+        if uncertain:
+            final_emotion = "uncertain"
+
+        iot_emotion, iot_hold_remaining, iot_transition_decision = self._update_iot_actuation(
+            final_emotion=final_emotion,
+            final_confidence=final_conf,
+            uncertain=uncertain,
+            now_ts=timestamp,
+        )
+
+        LOGGER.debug("FER raw scores: %s", raw_scores)
+        LOGGER.debug("Rule triggers: %s", rules)
+        LOGGER.debug("Smoothed scores: %s", smoothed)
+        LOGGER.debug("Final emotion: %s (%.3f) reason=%s", final_emotion, final_conf, debug_reason)
+
+        return ProcessEmotionResult(
+            raw_scores=raw_scores,
+            calibrated_scores=calibrated,
+            weighted_scores=weighted,
+            rule_adjusted_scores=rule_adjusted,
+            smoothed_scores=smoothed,
+            raw_top_emotion=raw_top_emotion,
+            raw_top_confidence=raw_top_conf,
+            smoothed_top_emotion=smoothed_top_emotion,
+            smoothed_top_confidence=smoothed_top_conf,
+            final_emotion=final_emotion,
+            final_confidence=final_conf,
+            iot_emotion=iot_emotion,
+            iot_hold_remaining=iot_hold_remaining,
+            iot_transition_decision=iot_transition_decision,
+            triggered_rules=rules,
+            hold_active=hold_active,
+            hold_remaining=hold_remaining,
+            transition_decision=transition_decision,
+            uncertain=uncertain,
+            status=status,
+            debug_reason=debug_reason,
+            low_confidence_reason=low_conf.reason,
+            filtered_scores=filtered,
+        )
+
+    def evaluate(self, raw_scores: Dict[str, float], features: Dict[str, Any], now_ts: float, face_quality: float = 1.0) -> Dict[str, Any]:
+        result = self.process_emotion_signal(
+            fer_scores=raw_scores,
+            landmarks=features,
+            current_state=None,
+            timestamp=now_ts,
+            movement_metrics=None,
+            face_quality=face_quality,
+        )
+        data = asdict(result)
+
+        # Keep legacy keys expected by realtime loop and logger.
+        data["raw_emotion"] = result.raw_top_emotion
+        data["raw_confidence"] = result.raw_top_confidence
+        data["smoothed_emotion"] = result.smoothed_top_emotion
+        data["smoothed_confidence"] = result.smoothed_top_confidence
+        data["rule_triggers"] = result.triggered_rules
+        data["scores"] = result.raw_scores
+        data["candidate_scores"] = self._blend_candidate_scores(
+            raw_calibrated=result.calibrated_scores,
+            corrected=result.rule_adjusted_scores,
+            smoothed=result.smoothed_scores,
+        )
+        data["hold_remaining"] = result.hold_remaining
+        data["iot_emotion"] = result.iot_emotion
+        data["iot_hold_remaining"] = result.iot_hold_remaining
+        data["iot_transition_decision"] = result.iot_transition_decision
+        data["face_quality"] = face_quality
+        data["feature_baseline"] = self.feature_baseline
+        data["quality_adjusted_scores"] = result.filtered_scores
+        return data
+
+    def _update_iot_actuation(
+        self,
+        final_emotion: str,
+        final_confidence: float,
+        uncertain: bool,
+        now_ts: float,
+    ) -> Tuple[str, float, str]:
+        """Generate a debounced emotion signal suitable for IoT actuation."""
+        if not self.config.iot_actuation_enabled:
+            return final_emotion, 0.0, "disabled"
+
+        if self.config.iot_block_uncertain and uncertain:
+            return self.iot_emotion, max(0.0, self.iot_hold_until - now_ts), "blocked_uncertain"
+
+        if final_confidence < self.config.iot_min_confidence:
+            return self.iot_emotion, max(0.0, self.iot_hold_until - now_ts), "blocked_low_conf"
+
+        if final_emotion == "uncertain":
+            return self.iot_emotion, max(0.0, self.iot_hold_until - now_ts), "blocked_uncertain_label"
+
+        if final_emotion == self.iot_emotion:
+            self.iot_candidate_emotion = None
+            self.iot_candidate_count = 0
+            self.iot_hold_until = now_ts + self.config.iot_actuation_hold_seconds
+            return self.iot_emotion, self.config.iot_actuation_hold_seconds, "refresh_same"
+
+        if self.iot_candidate_emotion == final_emotion:
+            self.iot_candidate_count += 1
+        else:
+            self.iot_candidate_emotion = final_emotion
+            self.iot_candidate_count = 1
+
+        if now_ts < self.iot_hold_until:
+            if final_confidence >= (self.current_confidence + self.config.iot_override_margin):
+                self.iot_emotion = final_emotion
+                self.iot_hold_until = now_ts + self.config.iot_actuation_hold_seconds
+                self.iot_candidate_emotion = None
+                self.iot_candidate_count = 0
+                return self.iot_emotion, self.config.iot_actuation_hold_seconds, "override_during_hold"
+            return self.iot_emotion, max(0.0, self.iot_hold_until - now_ts), "hold_active"
+
+        if self.iot_candidate_count < max(1, int(self.config.iot_confirm_streak)):
+            return self.iot_emotion, max(0.0, self.iot_hold_until - now_ts), "await_confirm"
+
+        self.iot_emotion = final_emotion
+        self.iot_hold_until = now_ts + self.config.iot_actuation_hold_seconds
+        self.iot_candidate_emotion = None
+        self.iot_candidate_count = 0
+        return self.iot_emotion, self.config.iot_actuation_hold_seconds, "switch_confirmed"
+
+    def _select_candidate(
+        self,
+        smoothed_scores: Dict[str, float],
+        corrected_scores: Dict[str, float],
+        raw_scores: Dict[str, float],
+    ) -> Tuple[Optional[str], float]:
+        candidate_scores = self._blend_candidate_scores(
+            raw_calibrated=raw_scores,
+            corrected=corrected_scores,
+            smoothed=smoothed_scores,
+        )
+        return pick_top(candidate_scores)
 
     def _blend_candidate_scores(
         self,
@@ -259,6 +532,40 @@ class EmotionIntelligenceEngine:
                 + (0.32 * float(smoothed.get(emotion, 0.0)))
             )
         return normalize_scores(merged)
+
+    def _low_confidence_filter(self, scores: Dict[str, float]) -> LowConfidenceResult:
+        if not scores:
+            return LowConfidenceResult(filtered_scores={}, status="uncertain", reason="empty_scores", uncertain=True)
+
+        sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        top1_name, top1_val = sorted_scores[0]
+        top2_val = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+        gap = float(top1_val - top2_val)
+
+        uncertain = False
+        reasons: List[str] = []
+
+        if top1_val < self.config.min_confidence_threshold:
+            uncertain = True
+            reasons.append("top_conf_below_threshold")
+
+        if gap < self.config.confidence_gap_threshold:
+            uncertain = True
+            reasons.append("top1_top2_gap_too_small")
+
+        filtered = dict(scores)
+        if uncertain:
+            # Keep explainable distribution but suppress overconfident winner.
+            filtered[top1_name] = float(top1_val) * 0.92
+            filtered = normalize_scores(filtered)
+            return LowConfidenceResult(
+                filtered_scores=filtered,
+                status="uncertain",
+                reason=";".join(reasons),
+                uncertain=True,
+            )
+
+        return LowConfidenceResult(filtered_scores=filtered, status="accepted", reason="accepted", uncertain=False)
 
     def _raw_confidence_override(
         self,
@@ -282,13 +589,13 @@ class EmotionIntelligenceEngine:
         if raw_emotion == final_emotion:
             return final_emotion, final_conf, False
 
-        if raw_conf < RAW_OVERRIDE_CONFIDENCE:
+        if raw_conf < self.config.raw_override_confidence:
             return final_emotion, final_conf, False
 
-        if self.raw_streak_count < RAW_OVERRIDE_STREAK:
+        if self.raw_streak_count < self.config.raw_override_streak:
             return final_emotion, final_conf, False
 
-        if (raw_conf - final_conf) < RAW_OVERRIDE_MARGIN:
+        if (raw_conf - final_conf) < self.config.raw_override_margin:
             return final_emotion, final_conf, False
 
         self.current_emotion = raw_emotion
@@ -298,16 +605,16 @@ class EmotionIntelligenceEngine:
     def _calibrate_scores(self, scores: Dict[str, float]) -> Dict[str, float]:
         # Apply a power calibration curve then renormalize.
         calibrated: Dict[str, float] = {}
-        for emotion in SUPPORTED_EMOTIONS:
+        for emotion in self.config.supported_emotions:
             value = clamp01(scores.get(emotion, 0.0))
-            calibrated[emotion] = value ** CONFIDENCE_CALIBRATION_POWER
+            calibrated[emotion] = value ** self.config.confidence_calibration_power
         return normalize_scores(calibrated)
 
     def _apply_weights(self, scores: Dict[str, float]) -> Dict[str, float]:
         # Emotion priors live in config so behavior can be tuned without code edits.
         weighted: Dict[str, float] = {}
         for emotion, score in scores.items():
-            weighted[emotion] = score * float(EMOTION_WEIGHTS.get(emotion, 1.0))
+            weighted[emotion] = score * float(self.config.emotion_weights.get(emotion, 1.0))
         return normalize_scores(weighted)
 
     def _apply_face_quality(self, scores: Dict[str, float], quality: float) -> Dict[str, float]:
@@ -316,7 +623,7 @@ class EmotionIntelligenceEngine:
         q = clamp01(quality)
         if q < 0.55:
             penalty = 1.0 - ((1.0 - q) * LOW_QUALITY_NON_NEUTRAL_PENALTY)
-            for emotion in SUPPORTED_EMOTIONS:
+            for emotion in self.config.supported_emotions:
                 if emotion == "neutral":
                     continue
                 adjusted[emotion] = adjusted.get(emotion, 0.0) * penalty
@@ -361,28 +668,46 @@ class EmotionIntelligenceEngine:
             weight = idx / len(self.buffer)
             for emotion, score in item.items():
                 aggregate[emotion] += float(score) * weight
-        return normalize_scores(dict(aggregate))
+
+        weighted_average = normalize_scores(dict(aggregate))
+        if not self.config.use_ema_smoothing:
+            return weighted_average
+
+        if self.ema_scores is None:
+            self.ema_scores = dict(weighted_average)
+            return weighted_average
+
+        alpha = clamp01(self.config.ema_alpha)
+        ema: Dict[str, float] = {}
+        keys = set(self.ema_scores) | set(weighted_average)
+        for emotion in keys:
+            prev = float(self.ema_scores.get(emotion, 0.0))
+            curr = float(weighted_average.get(emotion, 0.0))
+            ema[emotion] = (alpha * curr) + ((1.0 - alpha) * prev)
+        self.ema_scores = normalize_scores(ema)
+        return dict(self.ema_scores)
 
     def _transition_control(
         self,
         candidate_emotion: Optional[str],
         candidate_conf: float,
         smoothed_scores: Dict[str, float],
-    ) -> Tuple[Optional[str], float]:
+        now_ts: float,
+    ) -> Tuple[Optional[str], float, str]:
         if not candidate_emotion:
-            return None, 0.0
+            return None, 0.0, "no_candidate"
 
         if self.current_emotion is None:
             self.candidate_streak_emotion = None
             self.candidate_streak_count = 0
-            return candidate_emotion, candidate_conf
+            return candidate_emotion, candidate_conf, "initial_pick"
 
         # Keep current emotion unless the candidate exceeds the configured margin.
         current_score = float(smoothed_scores.get(self.current_emotion, self.current_confidence))
         if candidate_emotion == self.current_emotion:
             self.candidate_streak_emotion = None
             self.candidate_streak_count = 0
-            return candidate_emotion, candidate_conf
+            return candidate_emotion, candidate_conf, "same_emotion"
 
         # Build short evidence streak before allowing frequent flips.
         if self.candidate_streak_emotion == candidate_emotion:
@@ -393,15 +718,22 @@ class EmotionIntelligenceEngine:
 
         # If candidate repeatedly wins, reduce transition friction.
         if self.candidate_streak_count >= 3 and candidate_conf >= (current_score + (self.transition_margin * 0.5)):
-            return candidate_emotion, candidate_conf
+            self.last_transition_ts = now_ts
+            return candidate_emotion, candidate_conf, "streak_confirmed"
 
         # Very strong candidates can preempt quickly.
         if candidate_conf >= 0.62 and candidate_conf > current_score:
-            return candidate_emotion, candidate_conf
+            self.last_transition_ts = now_ts
+            return candidate_emotion, candidate_conf, "strong_candidate"
+
+        if (now_ts - self.last_transition_ts) < self.config.transition_cooldown_seconds:
+            return self.current_emotion, current_score, "blocked_by_cooldown"
 
         if candidate_emotion != self.current_emotion and (candidate_conf - current_score) < self.transition_margin:
-            return self.current_emotion, current_score
-        return candidate_emotion, candidate_conf
+            return self.current_emotion, current_score, "blocked_by_margin"
+
+        self.last_transition_ts = now_ts
+        return candidate_emotion, candidate_conf, "switched"
 
     def _apply_hold(
         self,
@@ -409,23 +741,23 @@ class EmotionIntelligenceEngine:
         candidate_conf: float,
         now_ts: float,
         smoothed_scores: Dict[str, float],
-    ) -> Tuple[str, float]:
+    ) -> Tuple[str, float, bool, float]:
         if not candidate_emotion:
             if self.current_emotion:
-                return self.current_emotion, self.current_confidence
-            return "uncertain", 0.0
+                return self.current_emotion, self.current_confidence, now_ts < self.hold_until, max(0.0, self.hold_until - now_ts)
+            return "uncertain", 0.0, False, 0.0
 
         if self.current_emotion is None:
             self.current_emotion = candidate_emotion
             self.current_confidence = candidate_conf
             self.hold_until = now_ts + self.hold_seconds
-            return self.current_emotion, self.current_confidence
+            return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
         if candidate_emotion == self.current_emotion:
             # Refresh hold window while emotion is stable.
             self.current_confidence = candidate_conf
             self.hold_until = now_ts + self.hold_seconds
-            return self.current_emotion, self.current_confidence
+            return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
         current_score = float(smoothed_scores.get(self.current_emotion, self.current_confidence))
         # During hold period, require a stronger margin before switching labels.
@@ -438,7 +770,7 @@ class EmotionIntelligenceEngine:
             self.current_emotion = candidate_emotion
             self.current_confidence = candidate_conf
             self.hold_until = now_ts + self.hold_seconds
-            return self.current_emotion, self.current_confidence
+            return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
         if (
             now_ts < self.hold_until
@@ -449,27 +781,32 @@ class EmotionIntelligenceEngine:
             self.current_emotion = candidate_emotion
             self.current_confidence = candidate_conf
             self.hold_until = now_ts + self.hold_seconds
-            return self.current_emotion, self.current_confidence
+            return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
-        if now_ts < self.hold_until and self.candidate_streak_count >= 3 and candidate_conf > current_score:
+        if now_ts < self.hold_until and self.candidate_streak_count >= 3 and candidate_conf >= (current_score + self.config.hold_override_margin):
             self.current_emotion = candidate_emotion
             self.current_confidence = candidate_conf
             self.hold_until = now_ts + self.hold_seconds
-            return self.current_emotion, self.current_confidence
+            return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
-        if now_ts < self.hold_until and candidate_conf >= 0.70:
+        if now_ts < self.hold_until and candidate_conf >= (current_score + self.config.hold_override_margin):
             self.current_emotion = candidate_emotion
             self.current_confidence = candidate_conf
             self.hold_until = now_ts + self.hold_seconds
-            return self.current_emotion, self.current_confidence
+            return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
         if now_ts < self.hold_until and candidate_conf < (current_score + self.hold_switch_margin):
-            return self.current_emotion, self.current_confidence
+            return (
+                self.current_emotion,
+                self.current_confidence,
+                True,
+                max(0.0, self.hold_until - now_ts),
+            )
 
         self.current_emotion = candidate_emotion
         self.current_confidence = candidate_conf
         self.hold_until = now_ts + self.hold_seconds
-        return self.current_emotion, self.current_confidence
+        return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
 
 class _TasksFaceMeshProcessor:
@@ -501,8 +838,9 @@ def _init_mediapipe_face_detector() -> Dict[str, Any]:
 
     solutions = getattr(mp, "solutions", None)
     if solutions is not None and hasattr(solutions, "face_detection"):
-        detector = solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.55)
-        return {"mode": "solutions", "detector": detector}
+        detector_short = solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.25)
+        detector_full = solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.20)
+        return {"mode": "solutions", "detectors": [detector_short, detector_full]}
 
     try:
         from mediapipe.tasks import python as mp_python
@@ -514,7 +852,7 @@ def _init_mediapipe_face_detector() -> Dict[str, Any]:
         options = vision.FaceDetectorOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=vision.RunningMode.IMAGE,
-            min_detection_confidence=0.55,
+            min_detection_confidence=0.20,
         )
         detector = vision.FaceDetector.create_from_options(options)
         return {"mode": "tasks", "detector": detector}
@@ -562,6 +900,13 @@ def get_face_detector_config() -> Dict[str, Any]:
     global _FACE_DETECTOR_CONFIG
     if _FACE_DETECTOR_CONFIG is None:
         _FACE_DETECTOR_CONFIG = _init_mediapipe_face_detector()
+        if _FACE_DETECTOR_CONFIG.get("mode") == "none":
+            LOGGER.error(
+                "MediaPipe face detector is unavailable in this Python environment. "
+                "Use the project venv interpreter to run realtime_emotion.py."
+            )
+        else:
+            LOGGER.info("MediaPipe face detector initialized in mode=%s", _FACE_DETECTOR_CONFIG.get("mode"))
     return _FACE_DETECTOR_CONFIG
 
 
@@ -596,6 +941,15 @@ def _frame_to_rgb(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
+def _enhance_detection_frame(frame_bgr: np.ndarray) -> np.ndarray:
+    """Improve contrast for detection without changing pipeline architecture."""
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    y = cv2.equalizeHist(y)
+    enhanced = cv2.merge((y, cr, cb))
+    return cv2.cvtColor(enhanced, cv2.COLOR_YCrCb2BGR)
+
+
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
@@ -627,6 +981,45 @@ def _distance(point_a: Tuple[float, float], point_b: Tuple[float, float]) -> flo
     return math.hypot(point_a[0] - point_b[0], point_a[1] - point_b[1])
 
 
+def _face_width(landmarks: List[Any]) -> float:
+    return max(_distance(_point(landmarks, 234), _point(landmarks, 454)), 1e-6)
+
+
+def mouth_open_ratio(landmarks: List[Any]) -> float:
+    mouth_open = _distance(_point(landmarks, 13), _point(landmarks, 14))
+    mouth_width = max(_distance(_point(landmarks, 61), _point(landmarks, 291)), 1e-6)
+    return float(mouth_open / mouth_width)
+
+
+def lip_spread_ratio(landmarks: List[Any]) -> float:
+    mouth_width = max(_distance(_point(landmarks, 61), _point(landmarks, 291)), 1e-6)
+    return float(mouth_width / _face_width(landmarks))
+
+
+def eye_open_ratio(landmarks: List[Any]) -> float:
+    left_eye_open = _distance(_point(landmarks, 159), _point(landmarks, 145))
+    right_eye_open = _distance(_point(landmarks, 386), _point(landmarks, 374))
+    return float(((left_eye_open + right_eye_open) * 0.5) / _face_width(landmarks))
+
+
+def eyebrow_position(landmarks: List[Any]) -> float:
+    left_brow_to_eye = _distance(_point(landmarks, 70), _point(landmarks, 159))
+    right_brow_to_eye = _distance(_point(landmarks, 300), _point(landmarks, 386))
+    return float(((left_brow_to_eye + right_brow_to_eye) * 0.5) / _face_width(landmarks))
+
+
+def eyebrow_inner_raise(landmarks: List[Any]) -> float:
+    left_inner = _distance(_point(landmarks, 107), _point(landmarks, 159))
+    right_inner = _distance(_point(landmarks, 336), _point(landmarks, 386))
+    return float(((left_inner + right_inner) * 0.5) / _face_width(landmarks))
+
+
+def smile_ratio(landmarks: List[Any]) -> float:
+    mouth_center_y = (_point(landmarks, 13)[1] + _point(landmarks, 14)[1]) * 0.5
+    corner_y = (_point(landmarks, 61)[1] + _point(landmarks, 291)[1]) * 0.5
+    return float(mouth_center_y - corner_y)
+
+
 def compute_face_quality(face_crop: np.ndarray) -> float:
     """Estimate face quality from sharpness and brightness for confidence modulation."""
     if face_crop is None or face_crop.size == 0:
@@ -654,10 +1047,22 @@ def _relative_bbox_to_xyxy(relative_box: Any, frame_w: int, frame_h: int) -> Opt
         return clamp_box(x1, y1, x2, y2, frame_w, frame_h)
 
     if hasattr(relative_box, "origin_x"):
-        x1 = int(relative_box.origin_x)
-        y1 = int(relative_box.origin_y)
-        x2 = x1 + int(relative_box.width)
-        y2 = y1 + int(relative_box.height)
+        ox = float(relative_box.origin_x)
+        oy = float(relative_box.origin_y)
+        bw = float(relative_box.width)
+        bh = float(relative_box.height)
+
+        # Some builds may expose normalized values here; handle both forms.
+        if bw <= 2.0 and bh <= 2.0 and ox <= 1.0 and oy <= 1.0:
+            x1 = int(ox * frame_w)
+            y1 = int(oy * frame_h)
+            x2 = x1 + int(bw * frame_w)
+            y2 = y1 + int(bh * frame_h)
+        else:
+            x1 = int(ox)
+            y1 = int(oy)
+            x2 = x1 + int(bw)
+            y2 = y1 + int(bh)
         return clamp_box(x1, y1, x2, y2, frame_w, frame_h)
 
     return None
@@ -691,52 +1096,93 @@ def detect_faces_mediapipe(frame: np.ndarray) -> List[Tuple[int, int, int, int, 
         return []
 
     detector_config = get_face_detector_config()
-    detector = detector_config.get("detector")
     mode = detector_config.get("mode")
-    if detector is None or mode == "none":
+    if mode == "none":
         return []
 
     frame_h, frame_w = frame.shape[:2]
-    rgb = _frame_to_rgb(frame)
 
-    if mode == "solutions":
-        result = detector.process(rgb)
-        detections = result.detections if result and result.detections else []
-    else:
+    def _run_detectors(frame_bgr: np.ndarray) -> List[Any]:
+        rgb = _frame_to_rgb(frame_bgr)
+        if mode == "solutions":
+            dets: List[Any] = []
+            detector_list = cast(List[Any], detector_config.get("detectors", []))
+            for det in detector_list:
+                result = det.process(rgb)
+                if result and result.detections:
+                    dets.extend(result.detections)
+            return dets
+
+        detector = detector_config.get("detector")
+        if detector is None:
+            return []
         mp_module = cast(Any, mp)
         mp_image = mp_module.Image(image_format=mp_module.ImageFormat.SRGB, data=rgb)
         result = detector.detect(mp_image)
-        detections = result.detections if result and result.detections else []
+        return result.detections if result and result.detections else []
 
-    # Keep only the highest-confidence face for low latency and stable behavior.
-    boxes: List[Tuple[int, int, int, int, float]] = []
-    for det in detections[:MAX_FACES_PROCESS]:
-        location_data = getattr(det, "location_data", None)
-        relative_box = getattr(location_data, "relative_bounding_box", None) if location_data else None
-        if relative_box is None:
-            relative_box = getattr(det, "bounding_box", None)
+    def _detections_to_boxes(
+        detections: List[Any],
+        det_w: int,
+        det_h: int,
+        scale_back_x: float = 1.0,
+        scale_back_y: float = 1.0,
+    ) -> List[Tuple[int, int, int, int, float]]:
+        boxes_local: List[Tuple[int, int, int, int, float]] = []
+        for det in detections:
+            location_data = getattr(det, "location_data", None)
+            relative_box = getattr(location_data, "relative_bounding_box", None) if location_data else None
+            if relative_box is None:
+                relative_box = getattr(det, "bounding_box", None)
 
-        box = _relative_bbox_to_xyxy(relative_box, frame_w, frame_h)
-        if box is None:
-            continue
+            box = _relative_bbox_to_xyxy(relative_box, det_w, det_h)
+            if box is None:
+                continue
 
-        x1, y1, x2, y2 = box
-        if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE:
-            continue
+            x1, y1, x2, y2 = box
+            if scale_back_x != 1.0 or scale_back_y != 1.0:
+                x1 = int(x1 / scale_back_x)
+                y1 = int(y1 / scale_back_y)
+                x2 = int(x2 / scale_back_x)
+                y2 = int(y2 / scale_back_y)
+                scaled = clamp_box(x1, y1, x2, y2, frame_w, frame_h)
+                if scaled is None:
+                    continue
+                x1, y1, x2, y2 = scaled
 
-        score = 0.0
-        raw_score = getattr(det, "score", None)
-        if raw_score:
-            score = float(raw_score[0])
-        else:
-            categories = getattr(det, "categories", None)
-            if categories:
-                score = float(getattr(categories[0], "score", 0.0))
+            if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE:
+                continue
 
-        boxes.append((x1, y1, x2, y2, score))
+            score = 0.0
+            raw_score = getattr(det, "score", None)
+            if raw_score:
+                score = float(raw_score[0])
+            else:
+                categories = getattr(det, "categories", None)
+                if categories:
+                    score = float(getattr(categories[0], "score", 0.0))
+
+            boxes_local.append((x1, y1, x2, y2, score))
+        return boxes_local
+
+    # Pass 1: direct frame.
+    detections = _run_detectors(frame)
+    boxes = _detections_to_boxes(detections, frame_w, frame_h)
+
+    # Pass 2: contrast-enhanced frame.
+    if not boxes:
+        enhanced = _enhance_detection_frame(frame)
+        detections = _run_detectors(enhanced)
+        boxes = _detections_to_boxes(detections, frame_w, frame_h)
+
+    # Pass 3: upscaled enhanced frame for small/far faces.
+    if not boxes:
+        upscaled = cv2.resize(_enhance_detection_frame(frame), (frame_w * 2, frame_h * 2), interpolation=cv2.INTER_LINEAR)
+        detections = _run_detectors(upscaled)
+        boxes = _detections_to_boxes(detections, frame_w * 2, frame_h * 2, scale_back_x=2.0, scale_back_y=2.0)
 
     boxes.sort(key=lambda item: item[4], reverse=True)
-    return boxes[:1]
+    return boxes[:MAX_FACES_PROCESS]
 
 
 def extract_face(
@@ -866,45 +1312,28 @@ def extract_features_mediapipe(frame: np.ndarray, mediapipe_config: Optional[Dic
 
     # On any extraction failure, return safe defaults so pipeline remains stable.
     try:
-        # Face width is used as a normalization factor for scale invariance.
-        face_width = max(_distance(_point(landmarks, 234), _point(landmarks, 454)), 1e-6)
-
-        mouth_open = _distance(_point(landmarks, 13), _point(landmarks, 14))
-        mouth_width = max(_distance(_point(landmarks, 61), _point(landmarks, 291)), 1e-6)
-        mouth_open_ratio = mouth_open / mouth_width
-        lip_spread_ratio = mouth_width / face_width
-
-        left_eye_open = _distance(_point(landmarks, 159), _point(landmarks, 145))
-        right_eye_open = _distance(_point(landmarks, 386), _point(landmarks, 374))
-        eye_open_ratio = ((left_eye_open + right_eye_open) * 0.5) / face_width
-
-        left_brow_to_eye = _distance(_point(landmarks, 70), _point(landmarks, 159))
-        right_brow_to_eye = _distance(_point(landmarks, 300), _point(landmarks, 386))
-        eyebrow_position = ((left_brow_to_eye + right_brow_to_eye) * 0.5) / face_width
-
-        left_inner = _distance(_point(landmarks, 107), _point(landmarks, 159))
-        right_inner = _distance(_point(landmarks, 336), _point(landmarks, 386))
-        eyebrow_inner_raise = ((left_inner + right_inner) * 0.5) / face_width
-
-        mouth_center_y = (_point(landmarks, 13)[1] + _point(landmarks, 14)[1]) * 0.5
-        corner_y = (_point(landmarks, 61)[1] + _point(landmarks, 291)[1]) * 0.5
-        smile_ratio = (mouth_center_y - corner_y)
+        mouth_open = mouth_open_ratio(landmarks)
+        lip_spread = lip_spread_ratio(landmarks)
+        eyes_open = eye_open_ratio(landmarks)
+        brows_pos = eyebrow_position(landmarks)
+        brows_inner_raise = eyebrow_inner_raise(landmarks)
+        smile = smile_ratio(landmarks)
 
         expression_intensity = (
-            abs(mouth_open_ratio - float(MOUTH_OPEN_THRESHOLD))
-            + abs(eye_open_ratio - float(EYE_OPEN_THRESHOLD))
-            + abs(eyebrow_inner_raise - float(EYEBROW_INNER_RAISE_THRESHOLD))
-            + abs(smile_ratio - float(SMILE_RATIO_THRESHOLD))
+            abs(mouth_open - float(MOUTH_OPEN_THRESHOLD))
+            + abs(eyes_open - float(EYE_OPEN_THRESHOLD))
+            + abs(brows_inner_raise - float(EYEBROW_INNER_RAISE_THRESHOLD))
+            + abs(smile - float(SMILE_RATIO_THRESHOLD))
         ) * 0.25
 
         features.update(
             {
-                "mouth_open_ratio": float(mouth_open_ratio),
-                "lip_spread_ratio": float(lip_spread_ratio),
-                "eye_open_ratio": float(eye_open_ratio),
-                "eyebrow_position": float(eyebrow_position),
-                "eyebrow_inner_raise": float(eyebrow_inner_raise),
-                "smile_ratio": float(smile_ratio),
+                "mouth_open_ratio": float(mouth_open),
+                "lip_spread_ratio": float(lip_spread),
+                "eye_open_ratio": float(eyes_open),
+                "eyebrow_position": float(brows_pos),
+                "eyebrow_inner_raise": float(brows_inner_raise),
+                "smile_ratio": float(smile),
                 "expression_intensity": float(expression_intensity),
                 "available": True,
             }
@@ -927,17 +1356,37 @@ def landmark_signature(features: Dict[str, Any]) -> Optional[Tuple[float, float,
     )
 
 
+def landmark_change_delta(
+    previous: Optional[Tuple[float, float, float, float]],
+    current: Optional[Tuple[float, float, float, float]],
+) -> Tuple[float, float]:
+    if previous is None or current is None:
+        return 0.0, 0.0
+    deltas = [abs(a - b) for a, b in zip(previous, current)]
+    return float(sum(deltas)), float(max(deltas) if deltas else 0.0)
+
+
+def face_box_movement_delta(
+    previous_box: Optional[Tuple[int, int, int, int]],
+    current_box: Optional[Tuple[int, int, int, int]],
+) -> float:
+    if previous_box is None or current_box is None:
+        return 0.0
+
+    prev_cx = (previous_box[0] + previous_box[2]) * 0.5
+    prev_cy = (previous_box[1] + previous_box[3]) * 0.5
+    curr_cx = (current_box[0] + current_box[2]) * 0.5
+    curr_cy = (current_box[1] + current_box[3]) * 0.5
+    return float(math.hypot(curr_cx - prev_cx, curr_cy - prev_cy))
+
+
 def landmark_changed(
     previous: Optional[Tuple[float, float, float, float]],
     current: Optional[Tuple[float, float, float, float]],
     threshold: float = LANDMARK_CHANGE_THRESHOLD,
 ) -> bool:
     # L1 distance is enough here and cheaper than more complex metrics.
-    if previous is None or current is None:
-        return False
-    deltas = [abs(a - b) for a, b in zip(previous, current)]
-    delta = sum(deltas)
-    max_delta = max(deltas) if deltas else 0.0
+    delta, max_delta = landmark_change_delta(previous, current)
     return delta >= threshold and max_delta >= (threshold * 0.35)
 
 
@@ -947,14 +1396,7 @@ def face_movement_detected(
     movement_threshold_px: float,
 ) -> bool:
     # Compare center-point motion between previous and current face boxes.
-    if previous_box is None or current_box is None:
-        return False
-
-    prev_cx = (previous_box[0] + previous_box[2]) * 0.5
-    prev_cy = (previous_box[1] + previous_box[3]) * 0.5
-    curr_cx = (current_box[0] + current_box[2]) * 0.5
-    curr_cy = (current_box[1] + current_box[3]) * 0.5
-    return math.hypot(curr_cx - prev_cx, curr_cy - prev_cy) >= movement_threshold_px
+    return face_box_movement_delta(previous_box, current_box) >= movement_threshold_px
 
 
 def apply_facial_rules(
@@ -1254,12 +1696,16 @@ def decide_emotion_from_scores(scores: Dict[str, float], threshold: float = MIN_
 
 __all__ = [
     "DetectionCache",
+    "EmotionEngineConfig",
     "EmotionHistory",
     "EmotionIntelligenceEngine",
+    "LowConfidenceResult",
+    "ProcessEmotionResult",
     "analyze_emotion",
     "analyze_emotion_fer",
     "apply_emotion_rules",
     "cache_last_result",
+    "face_box_movement_delta",
     "crop_face",
     "compute_face_quality",
     "decide_emotion_from_scores",
@@ -1272,8 +1718,13 @@ __all__ = [
     "get_face_detector_config",
     "get_face_mesh_config",
     "get_final_emotion",
+    "landmark_change_delta",
     "landmark_changed",
     "landmark_signature",
+    "mouth_open_ratio",
+    "eye_open_ratio",
+    "eyebrow_position",
+    "smile_ratio",
     "log_rate_limited_warning",
     "preprocess_face",
     "print_score_comparison",
