@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ from pathlib import Path
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, cast
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -19,6 +20,10 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import cv2
 import numpy as np
+try:
+    import mediapipe as mp
+except Exception:  # pragma: no cover
+    mp = None
 
 from config import (
     BENCHMARK_REPORT_PATH,
@@ -44,6 +49,16 @@ from config import (
     BOX_THICKNESS,
     DEFAULT_EMOTION_COLOR,
     FACE_MOVEMENT_THRESHOLD_PX,
+    FACE_LIGHT_BLUR,
+    FACE_LIGHT_ENABLED,
+    FACE_LIGHT_STRENGTH,
+    MESH_ALPHA,
+    MESH_COLOR,
+    MESH_DRAW_IRISES,
+    MESH_GLOW_STRENGTH,
+    MESH_OVERLAY_DEFAULT,
+    MESH_POINT_RADIUS,
+    MESH_THICKNESS,
 )
 from emotion_engine import (
     DetectionCache,
@@ -56,6 +71,7 @@ from emotion_engine import (
     extract_features_mediapipe,
     face_movement_detected,
     get_face_mesh_config,
+    get_face_landmarks_mediapipe,
     landmark_changed,
     landmark_signature,
     preprocess_face,
@@ -71,6 +87,151 @@ STATUS_TRACKING = "Tracking"
 STATUS_HEAVY = "Heavy inference"
 STATUS_NO_FACE = "No face"
 STATUS_UNCERTAIN = "uncertain"
+
+_MESH_SUPPORT_WARNED = False
+
+# Fixed sparse topology to match the provided reference look.
+_REFERENCE_NODE_INDICES = [
+    151, 70, 300,
+    33, 133, 362, 263,
+    168, 4,
+    61, 291, 13,
+    58, 288, 152,
+    152,
+]
+
+
+def _reference_style_connections() -> list[tuple[int, int]]:
+    """Sparse, stylized landmark connections similar to the provided reference look."""
+    return [
+        # Forehead and center fan (minimal)
+        (70, 151), (151, 300),
+        (151, 33), (151, 263),
+        # Eyes and bridge
+        (33, 133), (362, 263),
+        (33, 168), (168, 263),
+        # Nose and mouth frame
+        (168, 4),
+        (4, 61), (4, 291),
+        # Mouth and smile frame
+        (61, 13), (13, 291), (61, 291),
+        # Jaw/chin frame (minimal)
+        (58, 152), (152, 288),
+        (58, 61), (288, 291),
+    ]
+
+
+def _fallback_mesh_connections() -> list[tuple[int, int]]:
+    """Minimal static facial connection set for MediaPipe-style 468 landmarks."""
+    return [
+        # Jawline
+        (10, 338), (338, 297), (297, 332), (332, 284), (284, 251), (251, 389),
+        (389, 356), (356, 454), (454, 323), (323, 361), (361, 288), (288, 397),
+        (397, 365), (365, 379), (379, 378), (378, 400), (400, 377), (377, 152),
+        (152, 148), (148, 176), (176, 149), (149, 150), (150, 136), (136, 172),
+        (172, 58), (58, 132), (132, 93), (93, 234), (234, 127), (127, 162),
+        (162, 21), (21, 54), (54, 103), (103, 67), (67, 109), (109, 10),
+        # Right eye / brow
+        (33, 7), (7, 163), (163, 144), (144, 145), (145, 153), (153, 154),
+        (154, 155), (155, 133), (133, 173), (173, 157), (157, 158), (158, 159),
+        (159, 160), (160, 161), (161, 246), (246, 33),
+        (70, 63), (63, 105), (105, 66), (66, 107),
+        # Left eye / brow
+        (263, 249), (249, 390), (390, 373), (373, 374), (374, 380), (380, 381),
+        (381, 382), (382, 362), (362, 398), (398, 384), (384, 385), (385, 386),
+        (386, 387), (387, 388), (388, 466), (466, 263),
+        (300, 293), (293, 334), (334, 296), (296, 336),
+        # Nose bridge and sides
+        (168, 6), (6, 197), (197, 195), (195, 5), (5, 4),
+        (4, 45), (45, 220), (220, 115), (115, 48),
+        (4, 275), (275, 440), (440, 344), (344, 278),
+        # Lips outer
+        (61, 146), (146, 91), (91, 181), (181, 84), (84, 17), (17, 314),
+        (314, 405), (405, 321), (321, 375), (375, 291), (291, 308), (308, 324),
+        (324, 318), (318, 402), (402, 317), (317, 14), (14, 87), (87, 178),
+        (178, 88), (88, 95), (95, 78), (78, 61),
+    ]
+
+
+def _resolve_mesh_connections() -> Optional[list[tuple[int, int]]]:
+    """Resolve mesh connection sets across MediaPipe package variants."""
+    # Intentionally use sparse stylized topology for a clean, reference-like look.
+    return _reference_style_connections()
+
+
+def draw_face_mesh_overlay(frame: np.ndarray, landmarks: Any) -> None:
+    """Draw lightweight mesh (contours + optional irises) for visualization."""
+    global _MESH_SUPPORT_WARNED
+
+    if mp is None or not landmarks:
+        return
+
+    connections = _resolve_mesh_connections()
+    overlay = frame.copy()
+    glow_overlay = np.zeros_like(frame)
+    h, w = frame.shape[:2]
+
+    points: list[tuple[int, int]] = []
+    for p in landmarks:
+        points.append((int(float(p.x) * w), int(float(p.y) * h)))
+
+    if FACE_LIGHT_ENABLED and points:
+        hull = cv2.convexHull(np.array(points, dtype=np.int32))
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+        blur_size = max(3, int(FACE_LIGHT_BLUR) | 1)
+        mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+        alpha_mask = (mask.astype(np.float32) / 255.0) * float(max(0.0, min(1.0, FACE_LIGHT_STRENGTH)))
+        bright = cv2.convertScaleAbs(frame, alpha=1.16, beta=48)
+        alpha_mask_3 = alpha_mask[..., None]
+        lit = frame.astype(np.float32) * (1.0 - alpha_mask_3) + bright.astype(np.float32) * alpha_mask_3
+        frame[:] = np.clip(lit, 0, 255).astype(np.uint8)
+
+    node_indices: set[int] = set(_REFERENCE_NODE_INDICES)
+    if connections:
+        for a, b in connections:
+            if a >= len(landmarks) or b >= len(landmarks):
+                continue
+            p1 = landmarks[a]
+            p2 = landmarks[b]
+            x1, y1 = int(float(p1.x) * w), int(float(p1.y) * h)
+            x2, y2 = int(float(p2.x) * w), int(float(p2.y) * h)
+            # Neon-style line stack: broad cyan glow, mid glow, thin white core.
+            cv2.line(glow_overlay, (x1, y1), (x2, y2), MESH_COLOR, MESH_THICKNESS + 4, cv2.LINE_AA)
+            cv2.line(glow_overlay, (x1, y1), (x2, y2), (255, 240, 180), MESH_THICKNESS + 2, cv2.LINE_AA)
+            cv2.line(overlay, (x1, y1), (x2, y2), (255, 255, 255), max(1, MESH_THICKNESS), cv2.LINE_AA)
+    else:
+        # Fallback for MediaPipe builds without face-mesh connection constants.
+        if not _MESH_SUPPORT_WARNED:
+            LOGGER.warning("Mesh connections unavailable; using landmark-point fallback overlay")
+            _MESH_SUPPORT_WARNED = True
+        point_radius = max(1, MESH_POINT_RADIUS)
+        for idx, p in enumerate(landmarks):
+            # Skip every other point to reduce visual clutter while keeping the overlay visible.
+            if idx % 2 == 1:
+                continue
+            x, y = int(float(p.x) * w), int(float(p.y) * h)
+            cv2.circle(glow_overlay, (x, y), point_radius + 3, MESH_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(overlay, (x, y), point_radius, MESH_COLOR, -1, cv2.LINE_AA)
+
+    # Add sparse node dots (connection nodes only) for a clean reference-style look.
+    point_radius = max(1, MESH_POINT_RADIUS)
+    node_points: list[tuple[int, int]] = []
+    for idx in sorted(node_indices):
+        if 0 <= idx < len(points):
+            node_points.append(points[idx])
+
+    for x, y in node_points:
+        cv2.circle(glow_overlay, (x, y), point_radius + 6, MESH_COLOR, -1, cv2.LINE_AA)
+        cv2.circle(glow_overlay, (x, y), point_radius + 3, (255, 245, 200), -1, cv2.LINE_AA)
+        cv2.circle(overlay, (x, y), point_radius + 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+    glow_blur = cv2.GaussianBlur(glow_overlay, (0, 0), sigmaX=3.8, sigmaY=3.8)
+    glow_alpha = float(max(0.0, min(1.0, MESH_GLOW_STRENGTH)))
+    cv2.addWeighted(glow_blur, glow_alpha, frame, 1.0, 0.0, dst=frame)
+
+    alpha = max(0.0, min(1.0, float(MESH_ALPHA)))
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
 
 
 def scale_box_to_original(
@@ -115,8 +276,12 @@ def draw_results(frame: np.ndarray, result: Dict[str, Any], fps: float) -> None:
     smoothed_emotion = str(result.get("smoothed_emotion", STATUS_UNCERTAIN))
     smoothed_confidence = float(result.get("smoothed_confidence", 0.0))
     status = str(result.get("status", STATUS_TRACKING))
+    decision_source = str(result.get("decision_source", "SMOOTHED"))
     iot_emotion = str(result.get("iot_emotion", final_emotion))
     iot_hold_remaining = float(result.get("iot_hold_remaining", 0.0))
+    geometry_emotion = str(result.get("geometry_emotion", "none"))
+    geometry_strength = float(result.get("geometry_strength", 0.0))
+    expression_intensity = float(result.get("expression_intensity", 0.0))
 
     color = EMOTION_COLORS.get(final_emotion, DEFAULT_EMOTION_COLOR)
 
@@ -139,9 +304,12 @@ def draw_results(frame: np.ndarray, result: Dict[str, Any], fps: float) -> None:
 
     panel_lines = [
         f"Status: {status}",
+        f"Decision: {decision_source}",
+        f"Geometry: {geometry_emotion.upper()} {geometry_strength * 100:.0f}%",
         f"Raw: {raw_emotion.upper()} {raw_confidence * 100:.0f}%",
         f"Smoothed: {smoothed_emotion.upper()} {smoothed_confidence * 100:.0f}%",
         f"Final: {final_emotion.upper()} {final_confidence * 100:.0f}%",
+        f"Intensity: {expression_intensity:.2f}",
         f"IoT: {iot_emotion.upper()} hold {iot_hold_remaining:.1f}s",
     ]
 
@@ -281,6 +449,9 @@ class EmotionDetectionPipeline:
         self.benchmark_stats = BenchmarkStats()
         self.session_start = time.time()
         self.event_logger = JsonlEventLogger(JSONL_LOG_PATH) if ENABLE_JSONL_LOGGING else None
+        self.mesh_enabled = bool(MESH_OVERLAY_DEFAULT)
+        self.mesh_landmarks_cache: Optional[Any] = None
+        self.mesh_landmark_count: int = 0
 
     def initialize_camera(self) -> bool:
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -320,6 +491,11 @@ class EmotionDetectionPipeline:
             "raw_confidence": 0.0,
             "smoothed_emotion": STATUS_UNCERTAIN,
             "smoothed_confidence": 0.0,
+            "decision_source": "SMOOTHED",
+            "geometry_emotion": "none",
+            "geometry_strength": 0.0,
+            "geometry_reason": "no_face",
+            "expression_intensity": 0.0,
             "final_emotion": STATUS_UNCERTAIN,
             "final_confidence": 0.0,
             "rule_triggers": [],
@@ -389,6 +565,18 @@ class EmotionDetectionPipeline:
         )
         time_trigger = (current_time - self.state.cache.last_detection_time) >= HEAVY_DETECTION_INTERVAL_SECONDS
 
+        if self.mesh_enabled:
+            mesh_landmarks = get_face_landmarks_mediapipe(frame, self.face_mesh_config)
+            if mesh_landmarks:
+                self.mesh_landmarks_cache = mesh_landmarks
+                self.mesh_landmark_count = len(mesh_landmarks)
+            else:
+                self.mesh_landmarks_cache = None
+                self.mesh_landmark_count = 0
+        if not self.mesh_enabled:
+            self.mesh_landmarks_cache = None
+            self.mesh_landmark_count = 0
+
         if not run_heavy and self.state.cache.result is not None:
             cached = dict(self.state.cache.result)
             cached["status"] = STATUS_TRACKING
@@ -417,6 +605,11 @@ class EmotionDetectionPipeline:
                 "raw_confidence": 0.0,
                 "smoothed_emotion": STATUS_UNCERTAIN,
                 "smoothed_confidence": 0.0,
+                "decision_source": "SMOOTHED",
+                "geometry_emotion": "none",
+                "geometry_strength": 0.0,
+                "geometry_reason": "no_fer_signal",
+                "expression_intensity": 0.0,
                 "final_emotion": STATUS_UNCERTAIN,
                 "final_confidence": 0.0,
                 "rule_triggers": [],
@@ -437,6 +630,11 @@ class EmotionDetectionPipeline:
             "raw_confidence": float(intelligence["raw_confidence"]),
             "smoothed_emotion": intelligence["smoothed_emotion"] or STATUS_UNCERTAIN,
             "smoothed_confidence": float(intelligence["smoothed_confidence"]),
+            "decision_source": intelligence.get("decision_source", "SMOOTHED"),
+            "geometry_emotion": intelligence.get("geometry_emotion") or "none",
+            "geometry_strength": float(intelligence.get("geometry_strength", 0.0)),
+            "geometry_reason": intelligence.get("geometry_reason", "n/a"),
+            "expression_intensity": float(intelligence.get("expression_intensity", 0.0)),
             "final_emotion": intelligence["final_emotion"],
             "final_confidence": float(intelligence["final_confidence"]),
             "iot_emotion": intelligence.get("iot_emotion", intelligence["final_emotion"]),
@@ -469,6 +667,11 @@ class EmotionDetectionPipeline:
                     "status": STATUS_HEAVY,
                     "raw_scores": result["scores"],
                     "rule_triggers": result["rule_triggers"],
+                    "decision_source": result.get("decision_source"),
+                    "geometry_emotion": result.get("geometry_emotion"),
+                    "geometry_strength": result.get("geometry_strength"),
+                    "geometry_reason": result.get("geometry_reason"),
+                    "expression_intensity": result.get("expression_intensity"),
                     "final_emotion": result["final_emotion"],
                     "final_confidence": result["final_confidence"],
                     "iot_emotion": result.get("iot_emotion"),
@@ -482,9 +685,10 @@ class EmotionDetectionPipeline:
             )
 
         LOGGER.info(
-            "FER raw=%s triggers=%s final=%s(%.2f) fps=%.1f",
+            "FER raw=%s triggers=%s source=%s final=%s(%.2f) fps=%.1f",
             result["scores"],
             result["rule_triggers"],
+            result.get("decision_source", "SMOOTHED"),
             result["final_emotion"],
             result["final_confidence"],
             self.state.fps,
@@ -492,7 +696,33 @@ class EmotionDetectionPipeline:
         return result
 
     def render(self, frame: np.ndarray, result: Dict[str, Any]) -> np.ndarray:
+        if self.mesh_enabled and self.mesh_landmarks_cache is not None:
+            draw_face_mesh_overlay(frame, self.mesh_landmarks_cache)
         draw_results(frame, result, self.update_fps())
+
+        mesh_state_text = (
+            f"MESH: ON ({self.mesh_landmark_count} pts)"
+            if self.mesh_enabled and self.mesh_landmark_count > 0
+            else ("MESH: ON (no landmarks)" if self.mesh_enabled else "MESH: OFF")
+        )
+        mesh_state_color = (
+            (70, 240, 120)
+            if self.mesh_enabled and self.mesh_landmark_count > 0
+            else ((0, 180, 255) if self.mesh_enabled else (140, 140, 140))
+        )
+        draw_text_with_bg(
+            frame,
+            mesh_state_text,
+            10,
+            frame.shape[0] - 16,
+            FONT,
+            FONT_SCALE,
+            mesh_state_color,
+            TEXT_THICKNESS,
+            BG_COLOR,
+            BG_PADDING,
+        )
+
         return resize_to_width(frame, DISPLAY_FRAME_WIDTH)
 
     def run(self) -> None:
@@ -500,7 +730,7 @@ class EmotionDetectionPipeline:
             print("ERROR: Camera is not initialized")
             return
 
-        print("Press 'q' to quit")
+        print("Press 'q' to quit | Press 'm' to toggle face mesh overlay")
 
         while True:
             ok, frame = self.cap.read()
@@ -517,7 +747,14 @@ class EmotionDetectionPipeline:
                 print("Benchmark duration reached. Stopping run.")
                 break
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("m"):
+                self.mesh_enabled = not self.mesh_enabled
+                if not self.mesh_enabled:
+                    self.mesh_landmarks_cache = None
+                    self.mesh_landmark_count = 0
+                LOGGER.info("Mesh overlay %s", "enabled" if self.mesh_enabled else "disabled")
+            if key == ord("q"):
                 break
 
         self._save_benchmark_report()

@@ -26,3 +26,4 @@ dist/
 # IDE settings and OS junk
 .vscode/
 .DS_Store
+datasets/
