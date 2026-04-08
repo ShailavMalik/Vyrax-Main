@@ -11,9 +11,9 @@ SHOW_FPS = True
 
 # Frame handling and scheduling
 DETECTION_FRAME_SIZE = (320, 240)  # (width, height)
-HEAVY_DETECTION_INTERVAL_SECONDS = 2.0
+HEAVY_DETECTION_INTERVAL_SECONDS = 1.0
 FACE_MOVEMENT_THRESHOLD_PX = 18.0
-LANDMARK_CHANGE_THRESHOLD = 0.07
+LANDMARK_CHANGE_THRESHOLD = 0.05
 
 # Face detection and crop
 MIN_FACE_SIZE = 20
@@ -52,8 +52,8 @@ EMOTION_WEIGHTS = {
     "happy": 1.02,
     "sad": 1.08,
     "angry": 1.20,
-    "surprise": 1.30,
-    "fear": 1.08,
+    "surprise": 1.10,
+    "fear": 0.92,
     "disgust": 1.40,
     "neutral": 0.90,
 }
@@ -113,6 +113,12 @@ EMOTION_COLORS = {
     "fear": (0, 190, 255),
     "disgust": (80, 180, 90),
     "uncertain": (180, 180, 180),
+}
+
+# Ensemble weights (new)
+ENSEMBLE_WEIGHTS = {
+    'fer': 0.6,
+    'deepface': 0.4
 }
 
 # Logging

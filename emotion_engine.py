@@ -134,6 +134,7 @@ _CLAHE_CHROMA = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
 _FACE_DETECTOR_CONFIG: Optional[Dict[str, Any]] = None
 _FACE_MESH_CONFIG: Optional[Dict[str, Any]] = None
 _FER_DETECTOR: Optional[Any] = None
+_LAST_EMOTION_SOURCE: str = "unknown"
 
 
 @dataclass
@@ -349,12 +350,61 @@ class EmotionIntelligenceEngine:
             smoothed_scores=smoothed,
         )
 
-        final_emotion, final_conf, raw_override = self._raw_confidence_override(
-            raw_emotion=raw_top_emotion,
-            raw_conf=raw_top_conf,
-            final_emotion=final_emotion,
-            final_conf=final_conf,
-        )
+        fallback_override_triggered = False
+        if using_heuristic_emotion_scores() and final_emotion == "neutral":
+            angry_signal = max(
+                float(rule_adjusted.get("angry", 0.0)),
+                float(smoothed.get("angry", 0.0)),
+                float(raw_scores.get("angry", 0.0)),
+            )
+            sad_signal = max(
+                float(rule_adjusted.get("sad", 0.0)),
+                float(smoothed.get("sad", 0.0)),
+                float(raw_scores.get("sad", 0.0)),
+            )
+            neutral_signal = max(
+                float(rule_adjusted.get("neutral", 0.0)),
+                float(smoothed.get("neutral", 0.0)),
+                float(raw_scores.get("neutral", 0.0)),
+            )
+
+            if (
+                "angry_fallback_geometry" in rules
+                and "sad_fallback_geometry" in rules
+                and max(angry_signal, sad_signal) >= 0.18
+            ):
+                if angry_signal >= sad_signal:
+                    final_emotion = "angry"
+                    final_conf = max(final_conf, angry_signal)
+                else:
+                    final_emotion = "sad"
+                    final_conf = max(final_conf, sad_signal)
+                fallback_override_triggered = True
+            elif "angry_fallback_geometry" in rules and angry_signal >= 0.18:
+                final_emotion = "angry"
+                final_conf = max(final_conf, angry_signal)
+                fallback_override_triggered = True
+            elif "sad_fallback_geometry" in rules and sad_signal >= 0.18:
+                final_emotion = "sad"
+                final_conf = max(final_conf, sad_signal)
+                fallback_override_triggered = True
+            elif raw_top_emotion in {"angry", "sad"} and raw_top_conf >= 0.28 and neutral_signal <= (raw_top_conf + 0.18):
+                final_emotion = raw_top_emotion
+                final_conf = max(final_conf, raw_top_conf)
+                fallback_override_triggered = True
+
+        if fallback_override_triggered:
+            rules.append("fallback_label_override")
+            transition_decision = "fallback_override"
+
+        raw_override = False
+        if has_ml_emotion_models():
+            final_emotion, final_conf, raw_override = self._raw_confidence_override(
+                raw_emotion=raw_top_emotion,
+                raw_conf=raw_top_conf,
+                final_emotion=final_emotion,
+                final_conf=final_conf,
+            )
         if raw_override:
             rules.append("raw_confidence_override")
             transition_decision = "raw_override"
@@ -527,9 +577,9 @@ class EmotionIntelligenceEngine:
         keys = set(raw_calibrated) | set(corrected) | set(smoothed)
         for emotion in keys:
             merged[emotion] = (
-                (0.25 * float(raw_calibrated.get(emotion, 0.0)))
-                + (0.43 * float(corrected.get(emotion, 0.0)))
-                + (0.32 * float(smoothed.get(emotion, 0.0)))
+                (0.20 * float(raw_calibrated.get(emotion, 0.0)))
+                + (0.50 * float(corrected.get(emotion, 0.0)))
+                + (0.30 * float(smoothed.get(emotion, 0.0)))
             )
         return normalize_scores(merged)
 
@@ -795,7 +845,7 @@ class EmotionIntelligenceEngine:
             self.hold_until = now_ts + self.hold_seconds
             return self.current_emotion, self.current_confidence, True, self.hold_seconds
 
-        if now_ts < self.hold_until and candidate_conf < (current_score + self.hold_switch_margin):
+        if now_ts < self.hold_until and candidate_conf < (current_score + self.config.hold_switch_margin):
             return (
                 self.current_emotion,
                 self.current_confidence,
@@ -1212,45 +1262,249 @@ def extract_face(
 crop_face = extract_face
 
 
-def detect_emotion_fer(face_crop: np.ndarray) -> Tuple[Optional[str], Dict[str, float]]:
-    """Run FER on a cropped face and return normalized probabilities."""
-    if face_crop is None or face_crop.size == 0:
-        return None, {}
+def _canonicalize_emotion_scores(raw_scores: Dict[str, float]) -> Dict[str, float]:
+    """Map model-specific label names into project labels and normalize."""
+    if not raw_scores:
+        return {}
 
-    # Primary path: FER package (fast and straightforward for emotion logits).
+    key_map = {
+        'sadness': 'sad',
+    }
+    merged: Dict[str, float] = {}
+    for key, value in raw_scores.items():
+        mapped = key_map.get(str(key).lower(), str(key).lower())
+        if mapped not in SUPPORTED_EMOTIONS:
+            continue
+        merged[mapped] = merged.get(mapped, 0.0) + clamp01(float(value))
+    return normalize_scores(merged)
+
+
+def has_ml_emotion_models() -> bool:
+    """Return True when FER or DeepFace backends are available."""
+    return (_get_fer_detector() is not None) or (DeepFace is not None)
+
+
+def using_heuristic_emotion_scores() -> bool:
+    """Return True when the most recent emotion scores came from the heuristic fallback."""
+    return _LAST_EMOTION_SOURCE == "heuristic"
+
+
+def _heuristic_emotion_scores(face_crop: np.ndarray) -> Dict[str, float]:
+    """Estimate coarse emotion distribution from landmarks when ML models are unavailable."""
+    candidates: List[np.ndarray] = [face_crop]
+    try:
+        candidates.append(cv2.resize(face_crop, (192, 192), interpolation=cv2.INTER_LINEAR))
+    except Exception:
+        pass
+    try:
+        enhanced = _enhance_detection_frame(face_crop)
+        candidates.append(enhanced)
+        candidates.append(cv2.resize(enhanced, (192, 192), interpolation=cv2.INTER_LINEAR))
+    except Exception:
+        pass
+
+    features: Dict[str, Any] = {}
+    for candidate in candidates:
+        features = extract_features_mediapipe(candidate, get_face_mesh_config())
+        if features.get('available'):
+            break
+
+    if not features.get('available'):
+        # Soft prior avoids hard misclassification when geometry is unavailable.
+        return {
+            'neutral': 0.40,
+            'happy': 0.15,
+            'sad': 0.15,
+            'fear': 0.10,
+            'surprise': 0.10,
+            'angry': 0.06,
+            'disgust': 0.04,
+        }
+
+    mouth = float(features.get('mouth_open_ratio', 0.0))
+    lip_spread = float(features.get('lip_spread_ratio', 0.0))
+    eye = float(features.get('eye_open_ratio', 0.0))
+    brow = float(features.get('eyebrow_position', 0.0))
+    brow_inner = float(features.get('eyebrow_inner_raise', 0.0))
+    smile = float(features.get('smile_ratio', 0.0))
+    intensity = float(features.get('expression_intensity', 0.0))
+
+    happy = max(
+        0.0,
+        ((smile - SMILE_RATIO_THRESHOLD) * 12.0)
+        + ((lip_spread - LIP_SPREAD_RATIO_THRESHOLD) * 6.0)
+        + (max(0.0, mouth - MOUTH_OPEN_THRESHOLD) * 1.2),
+    )
+    surprise = max(
+        0.0,
+        ((mouth - SURPRISE_MOUTH_BOOST_THRESHOLD) * 4.5)
+        + ((eye - EYE_OPEN_THRESHOLD) * 2.8)
+        + ((brow_inner - SURPRISE_BROW_RAISE_THRESHOLD) * 3.2),
+    )
+    sad = max(
+        0.0,
+        ((SAD_SMILE_MAX - smile) * 4.0)
+        + ((EYE_OPEN_THRESHOLD - eye) * 2.0)
+        + ((SAD_LIP_SPREAD_MAX - lip_spread) * 1.5),
+    )
+    angry = max(
+        0.0,
+        ((EYEBROW_DOWN_THRESHOLD - brow) * 12.5)
+        + ((EYE_NARROW_THRESHOLD - eye) * 5.8)
+        + ((ANGRY_MOUTH_OPEN_MAX - mouth) * 3.6)
+        + ((SAD_LIP_SPREAD_MAX - lip_spread) * 2.2)
+        + ((SAD_SMILE_MAX - smile) * 1.8),
+    )
+    fear = max(
+        0.0,
+        ((eye - EYE_OPEN_THRESHOLD) * 1.6)
+        + ((brow_inner - EYEBROW_INNER_RAISE_THRESHOLD) * 1.5)
+        + ((mouth - MOUTH_OPEN_THRESHOLD) * 0.8)
+        - ((EYEBROW_DOWN_THRESHOLD - brow) * 2.2)
+        - ((EYE_NARROW_THRESHOLD - eye) * 1.2)
+        + (smile * -1.6),
+    )
+    disgust = max(0.0, ((EYEBROW_DOWN_THRESHOLD - brow) * 2.5) + ((mouth - MOUTH_OPEN_THRESHOLD) * -2.0) + 0.02)
+    neutral = max(
+        0.04,
+        0.36
+        - (intensity * 1.10)
+        - (happy * 0.20)
+        - (surprise * 0.15)
+        - (angry * 0.30)
+        - (sad * 0.26)
+        - (fear * 0.08),
+    )
+
+    scores = normalize_scores(
+        {
+            'happy': happy,
+            'surprise': surprise,
+            'sad': sad,
+            'angry': angry,
+            'fear': fear,
+            'disgust': disgust,
+            'neutral': neutral,
+        }
+    )
+
+    strong_surprise_shape = (
+        mouth >= SURPRISE_MOUTH_BOOST_THRESHOLD
+        and brow_inner >= SURPRISE_BROW_RAISE_THRESHOLD
+        and eye >= (EYE_OPEN_THRESHOLD * 1.08)
+    )
+    if not strong_surprise_shape and scores.get('fear', 0.0) > 0.34:
+        fear_excess = scores['fear'] - 0.34
+        scores['fear'] = 0.34
+        scores['sad'] = scores.get('sad', 0.0) + (fear_excess * 0.48)
+        scores['neutral'] = scores.get('neutral', 0.0) + (fear_excess * 0.32)
+        scores['angry'] = scores.get('angry', 0.0) + (fear_excess * 0.20)
+        scores = normalize_scores(scores)
+
+    # Keep heuristic outputs from becoming one-hot; this reduces sticky labels.
+    peak = max(scores.values()) if scores else 0.0
+    if peak > 0.62:
+        top_emotion = max(scores, key=scores.get)
+        excess = peak - 0.62
+        scores[top_emotion] = 0.62
+        spill_targets = [key for key in scores if key != top_emotion]
+        if spill_targets:
+            spill = excess / len(spill_targets)
+            for key in spill_targets:
+                scores[key] += spill
+        scores = normalize_scores(scores)
+
+    return scores
+
+
+def detect_emotion_ensemble(face_crop: np.ndarray) -> Tuple[Optional[str], Dict[str, float], Dict[str, Dict[str, float]]]:
+    """Run FER + DeepFace ensemble and return fused normalized scores.
+
+    Returns:
+        top_emotion: Highest scoring emotion label or None.
+        fused_scores: Weighted fusion across supported emotions.
+        per_model_scores: Raw normalized maps from FER and DeepFace.
+    """
+    global _LAST_EMOTION_SOURCE
+
+    if face_crop is None or face_crop.size == 0:
+        _LAST_EMOTION_SOURCE = "empty"
+        return None, {}, {}
+    
+    fer_scores: Dict[str, float] = {}
+    deepface_scores: Dict[str, float] = {}
+    
+    # FER (primary, fast)
     fer_model = _get_fer_detector()
-    if fer_model is not None:
+    if fer_model:
         try:
             rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
             detected = fer_model.detect_emotions(rgb)
             if detected:
-                emotions = cast(Dict[str, float], detected[0].get("emotions", {}))
-                scores = {name: clamp01(float(value)) for name, value in emotions.items()}
-                normalized = normalize_scores(scores)
-                return pick_top(normalized)[0], normalized
+                emotions = detected[0].get('emotions', {})
+                fer_scores = _canonicalize_emotion_scores({k: float(v) for k, v in emotions.items()})
+            else:
+                # FER often expects a little context around the face box.
+                padded = cv2.copyMakeBorder(rgb, 16, 16, 16, 16, cv2.BORDER_REFLECT_101)
+                detected = fer_model.detect_emotions(padded)
+                if detected:
+                    emotions = detected[0].get('emotions', {})
+                    fer_scores = _canonicalize_emotion_scores({k: float(v) for k, v in emotions.items()})
         except Exception:
             pass
+    
+    # DeepFace (secondary, slower but accurate)
+    if DeepFace:
+        try:
+            # Skip detector stage for pre-cropped faces to avoid empty detections.
+            result = DeepFace.analyze(
+                face_crop,
+                actions=['emotion'],
+                enforce_detection=False,
+                detector_backend='skip',
+                align=False,
+                silent=True,
+            )
+            if isinstance(result, list) and result:
+                emotion_dict = result[0].get('emotion', {})
+                deepface_scores = _canonicalize_emotion_scores(
+                    {k: (float(v) / 100.0 if float(v) > 1.0 else float(v)) for k, v in emotion_dict.items()}
+                )
+            elif isinstance(result, dict):
+                emotion_dict = result.get('emotion', {})
+                deepface_scores = _canonicalize_emotion_scores(
+                    {k: (float(v) / 100.0 if float(v) > 1.0 else float(v)) for k, v in emotion_dict.items()}
+                )
+        except Exception:
+            pass
+    
+    # If model-based scores are unavailable, fall back to geometry heuristics.
+    if not fer_scores and not deepface_scores:
+        heuristic_scores = _heuristic_emotion_scores(face_crop)
+        _LAST_EMOTION_SOURCE = "heuristic"
+        if not heuristic_scores:
+            return None, {}, {'fer': {}, 'deepface': {}, 'heuristic': {}}
+        top_emotion = max(heuristic_scores, key=heuristic_scores.get, default=None)
+        return top_emotion, heuristic_scores, {'fer': {}, 'deepface': {}, 'heuristic': heuristic_scores}
 
-    # Fallback path: DeepFace emotion analysis when FER is unavailable.
-    if DeepFace is None:
-        return None, {}
+    # Simple average fusion
+    all_emotions = set(fer_scores) | set(deepface_scores)
+    fused_scores = {}
+    for emotion in all_emotions:
+        f = fer_scores.get(emotion, 0.0) * 0.6
+        d = deepface_scores.get(emotion, 0.0) * 0.4
+        fused_scores[emotion] = f + d
+    fused_scores = normalize_scores(fused_scores)
+    _LAST_EMOTION_SOURCE = "ensemble"
+    
+    top_emotion = max(fused_scores, key=fused_scores.get, default=None)
+    
+    return top_emotion, fused_scores, {'fer': fer_scores, 'deepface': deepface_scores}
 
-    try:
-        result = DeepFace.analyze(face_crop, actions=["emotion"], enforce_detection=False, silent=True)
-        if isinstance(result, list):
-            result = result[0] if result else {}
-
-        emotion_dict = cast(Dict[str, float], result.get("emotion", {})) if isinstance(result, dict) else {}
-        scores: Dict[str, float] = {}
-        for name, raw in emotion_dict.items():
-            score = float(raw)
-            if score > 1.0:
-                score /= 100.0
-            scores[name] = clamp01(score)
-        normalized = normalize_scores(scores)
-        return pick_top(normalized)[0], normalized
-    except Exception:
-        return None, {}
+def detect_emotion_fer(face_crop: np.ndarray) -> Tuple[Optional[str], Dict[str, float]]:
+    """Legacy entrypoint that delegates to ensemble scoring."""
+    top, fused, _models = detect_emotion_ensemble(face_crop)
+    return top, fused
 
 
 analyze_emotion_fer = detect_emotion_fer
@@ -1412,6 +1666,10 @@ def apply_facial_rules(
     triggers: List[str] = []
     neutral_guard_active = False
 
+    if not features or not features.get("available"):
+        # Without valid landmarks, geometry-based rules are unreliable.
+        return normalize_scores(adjusted), ["rules_skipped_features_unavailable"]
+
     baseline = baseline or {}
     mouth_val = float(features.get("mouth_open_ratio", 0.0))
     lip_spread_val = float(features.get("lip_spread_ratio", 0.0))
@@ -1420,6 +1678,7 @@ def apply_facial_rules(
     inner_brow_val = float(features.get("eyebrow_inner_raise", 0.0))
     smile_val = float(features.get("smile_ratio", 0.0))
     expression_intensity = float(features.get("expression_intensity", 0.0))
+    fallback_mode = using_heuristic_emotion_scores()
 
     # Baseline-aware thresholds make rules personalized and less jittery.
     mouth_threshold = max(MOUTH_OPEN_THRESHOLD, float(baseline.get("mouth_open_ratio", 0.0)) * 1.45)
@@ -1436,69 +1695,150 @@ def apply_facial_rules(
     inner_raised = inner_brow_val >= inner_raise_threshold
     smile_high = smile_val >= smile_threshold
     lips_spread = lip_spread_val >= LIP_SPREAD_RATIO_THRESHOLD
+    sad_face_shape = (smile_val <= SAD_SMILE_MAX) and (lip_spread_val <= SAD_LIP_SPREAD_MAX)
+
+    if fallback_mode:
+        adjusted["sad"] = adjusted.get("sad", 0.0) * 1.02
+        adjusted["angry"] = adjusted.get("angry", 0.0) * 1.20
 
     # Guard neutral when expression cues are weak so neutral is not misread as sad/angry.
     neutral_support = adjusted.get("neutral", 0.0)
-    if expression_intensity <= LOW_EXPRESSION_INTENSITY_MAX and neutral_support >= 0.35:
-        adjusted["neutral"] = adjusted.get("neutral", 0.0) + NEUTRAL_GUARD_BOOST
+    neutral_guard_threshold = 0.50
+    neutral_guard_intensity = LOW_EXPRESSION_INTENSITY_MAX * 0.85
+    if fallback_mode:
+        neutral_guard_threshold = 0.84
+        neutral_guard_intensity = LOW_EXPRESSION_INTENSITY_MAX * 0.50
+
+    guard_sad_max = 0.18
+    guard_angry_max = 0.16
+    if fallback_mode:
+        guard_sad_max = 0.22
+        guard_angry_max = 0.22
+
+    sad_support = adjusted.get("sad", 0.0)
+    angry_support = adjusted.get("angry", 0.0)
+    if (
+        expression_intensity <= neutral_guard_intensity
+        and neutral_support >= neutral_guard_threshold
+        and adjusted.get("happy", 0.0) < 0.26
+        and adjusted.get("surprise", 0.0) < 0.34
+        and sad_support < guard_sad_max
+        and angry_support < guard_angry_max
+    ):
+        adjusted["neutral"] = adjusted.get("neutral", 0.0) + (NEUTRAL_GUARD_BOOST * 0.55)
         adjusted["sad"] = adjusted.get("sad", 0.0) * 0.86
         adjusted["angry"] = adjusted.get("angry", 0.0) * 0.90
         triggers.append("neutral_guard_low_expression")
         neutral_guard_active = True
+
+    # In fallback-only mode, let clear facial geometry promote sad/angry directly.
+    if fallback_mode and (eyebrows_down or eyebrow_val <= (eyebrow_down_threshold * 1.08)) and mouth_val <= (ANGRY_MOUTH_OPEN_MAX * 1.25) and (eyes_narrow or eye_val <= (eye_open_threshold * 1.20)) and smile_val <= (SAD_SMILE_MAX * 1.45):
+        adjusted["angry"] = max(adjusted.get("angry", 0.0), 0.70)
+        adjusted["sad"] = adjusted.get("sad", 0.0) * 0.72
+        adjusted["fear"] = adjusted.get("fear", 0.0) * 0.82
+        adjusted["neutral"] = adjusted.get("neutral", 0.0) * 0.52
+        triggers.append("angry_fallback_geometry")
+
+    if (
+        fallback_mode
+        and inner_raised
+        and sad_face_shape
+        and eye_val <= (eye_open_threshold * 1.08)
+        and smile_val <= (SAD_SMILE_MAX * 1.6)
+        and eyebrow_val > (eyebrow_down_threshold * 0.95)
+    ):
+        adjusted["sad"] = max(adjusted.get("sad", 0.0), 0.62)
+        adjusted["angry"] = adjusted.get("angry", 0.0) * 0.76
+        adjusted["fear"] = adjusted.get("fear", 0.0) * 0.88
+        adjusted["neutral"] = adjusted.get("neutral", 0.0) * 0.62
+        triggers.append("sad_fallback_geometry")
+
+    if fallback_mode and adjusted.get("fear", 0.0) >= 0.22 and not (mouth_open and inner_raised):
+        adjusted["fear"] = adjusted.get("fear", 0.0) * 0.45
+        if eyebrows_down or eyes_narrow:
+            adjusted["angry"] = max(adjusted.get("angry", 0.0), adjusted.get("fear", 0.0) * 1.05)
+            triggers.append("fear_rebalanced_to_angry")
+        elif sad_face_shape:
+            adjusted["sad"] = max(adjusted.get("sad", 0.0), adjusted.get("fear", 0.0) * 1.00)
+            triggers.append("fear_rebalanced_to_sad")
+        else:
+            adjusted["neutral"] = adjusted.get("neutral", 0.0) * 1.06
+            triggers.append("fear_suppressed_weak_geometry")
 
     surprise_prior = adjusted.get("surprise", 0.0)
     fear_prior = adjusted.get("fear", 0.0)
     angry_prior = adjusted.get("angry", 0.0)
     sad_prior = adjusted.get("sad", 0.0)
 
-    # Surprise heuristic: open mouth + raised inner brows should be enough on its own
-    # when the geometry is strong, with eyes-open acting as a confidence booster.
-    if mouth_open and inner_raised:
+    strong_surprise_geometry = (
+        mouth_val >= SURPRISE_MOUTH_BOOST_THRESHOLD
+        and inner_brow_val >= SURPRISE_BROW_RAISE_THRESHOLD
+    )
+    surprise_prior_supported = (
+        surprise_prior >= RULE_MIN_SURPRISE_OR_FEAR_SCORE
+        or fear_prior >= RULE_MIN_SURPRISE_OR_FEAR_SCORE
+    )
+
+    # Surprise should only be boosted when geometry is strong and FER/fear prior is plausible.
+    if mouth_open and inner_raised and (strong_surprise_geometry or surprise_prior_supported):
         surprise_boost = 0.26
         if eyes_open:
             surprise_boost += 0.14
         if expression_intensity >= (LOW_EXPRESSION_INTENSITY_MAX + 0.04):
             surprise_boost += 0.10
-        if surprise_prior >= RULE_MIN_SURPRISE_OR_FEAR_SCORE or fear_prior >= RULE_MIN_SURPRISE_OR_FEAR_SCORE:
+        if surprise_prior_supported:
             surprise_boost += 0.08
         adjusted["surprise"] = max(adjusted.get("surprise", 0.0) + surprise_boost, fear_prior * 0.92)
         adjusted["angry"] = adjusted.get("angry", 0.0) * 0.92
         adjusted["sad"] = adjusted.get("sad", 0.0) * 0.95
         triggers.append("surprise_boost_mouth_open_brow_raised")
 
-    # Secondary surprise cue: mouth open + eyes open, but only when surprise/fear is plausible.
-    if mouth_open and eyes_open and max(surprise_prior, fear_prior) >= RULE_MIN_SURPRISE_OR_FEAR_SCORE:
-        adjusted["surprise"] = adjusted.get("surprise", 0.0) + 0.18
+    # Secondary surprise cue is intentionally strict to avoid false positives.
+    if (
+        mouth_open
+        and eyes_open
+        and inner_raised
+        and strong_surprise_geometry
+        and surprise_prior_supported
+    ):
+        adjusted["surprise"] = adjusted.get("surprise", 0.0) + 0.12
         triggers.append("surprise_boost_mouth_open_eyes_open")
+
+    # If surprise geometry is absent and there is weak prior, softly decay surprise.
+    if (not mouth_open or not inner_raised) and surprise_prior < 0.22:
+        adjusted["surprise"] = adjusted.get("surprise", 0.0) * 0.85
 
     # Angry heuristic: lowered brows + narrowed eyes with stronger angry support than sad.
     if (
         eyebrows_down
         and eyes_narrow
         and mouth_val <= ANGRY_MOUTH_OPEN_MAX
-        and adjusted.get("angry", 0.0) >= RULE_MIN_ANGRY_SCORE
-        and angry_prior >= (sad_prior + 0.04)
+        and not (fallback_mode and inner_raised and sad_face_shape)
+        and (adjusted.get("angry", 0.0) >= 0.06 or angry_prior >= 0.06)
+        and angry_prior >= (sad_prior - 0.02)
     ):
-        adjusted["angry"] = adjusted.get("angry", 0.0) + 0.28
-        adjusted["sad"] = adjusted.get("sad", 0.0) * 0.90
+        adjusted["angry"] = adjusted.get("angry", 0.0) + 0.36
+        adjusted["sad"] = adjusted.get("sad", 0.0) * 0.82
+        adjusted["neutral"] = adjusted.get("neutral", 0.0) * 0.78
         triggers.append("angry_boost_eyebrows_down_eyes_narrow")
 
     # Sad heuristic: inner eyebrows raised + low eye openness with sad support above angry.
-    sad_face_shape = (smile_val <= SAD_SMILE_MAX) and (lip_spread_val <= SAD_LIP_SPREAD_MAX)
     if (
-        (not neutral_guard_active)
+        (not fallback_mode)
         and inner_raised
         and eyes_narrow
         and sad_face_shape
-        and adjusted.get("sad", 0.0) >= RULE_MIN_SAD_SCORE
-        and sad_prior >= (angry_prior + 0.04)
+        and (adjusted.get("sad", 0.0) >= 0.08 or sad_prior >= 0.08)
+        and sad_prior >= (angry_prior - 0.02)
     ):
-        adjusted["sad"] = adjusted.get("sad", 0.0) + 0.24
-        adjusted["angry"] = adjusted.get("angry", 0.0) * 0.90
+        adjusted["sad"] = adjusted.get("sad", 0.0) + 0.30
+        adjusted["angry"] = adjusted.get("angry", 0.0) * 0.85
+        adjusted["neutral"] = adjusted.get("neutral", 0.0) * 0.84
         triggers.append("sad_boost_inner_brows_raised_low_eyes")
 
     # Happy override only when happy already has enough baseline support.
-    if (smile_high or lips_spread) and adjusted.get("happy", 0.0) >= RULE_MIN_HAPPY_SCORE:
+    happy_rule_threshold = max(0.22, RULE_MIN_HAPPY_SCORE * 0.80)
+    if (smile_high or lips_spread) and adjusted.get("happy", 0.0) >= happy_rule_threshold:
         adjusted["happy"] = max(adjusted.get("happy", 0.0) + 0.35, adjusted.get("surprise", 0.0))
         triggers.append("happy_override_smile_or_lipspread")
 

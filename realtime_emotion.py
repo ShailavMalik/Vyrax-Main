@@ -55,6 +55,7 @@ from emotion_engine import (
     extract_face,
     extract_features_mediapipe,
     face_movement_detected,
+    get_face_detector_config,
     get_face_mesh_config,
     landmark_changed,
     landmark_signature,
@@ -273,24 +274,36 @@ class EmotionDetectionPipeline:
     def __init__(self, benchmark_seconds: int = 0, benchmark_report: Optional[str] = None) -> None:
         self.cap: Optional[cv2.VideoCapture] = None
         self.state = PipelineState(cache=DetectionCache(), last_fps_time=time.time())
+        self.face_detector_config = get_face_detector_config()
         self.face_mesh_config = get_face_mesh_config()
         self.engine = EmotionIntelligenceEngine()
         self.feature_baseline: Optional[Dict[str, float]] = None
         self.benchmark_seconds = max(0, int(benchmark_seconds))
         self.benchmark_report = benchmark_report or BENCHMARK_REPORT_PATH
         self.benchmark_stats = BenchmarkStats()
-        self.session_start = time.time()
+        self.session_start = 0.0
         self.event_logger = JsonlEventLogger(JSONL_LOG_PATH) if ENABLE_JSONL_LOGGING else None
 
     def initialize_camera(self) -> bool:
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
-        if not self.cap.isOpened():
+        capture_backends = []
+        if os.name == "nt":
+            capture_backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        else:
+            capture_backends = [cv2.CAP_ANY]
+
+        for backend in capture_backends:
+            self.cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+            if self.cap.isOpened():
+                break
+
+        if self.cap is None or not self.cap.isOpened():
             print("ERROR: Could not open webcam")
             return False
 
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         print("Camera initialized")
         return True
 
@@ -402,12 +415,12 @@ class EmotionDetectionPipeline:
         if face_crop is None:
             return self._no_face_result()
 
-        # Heavy pass uses normalized crop for FER and geometric features.
+        # Heavy pass prepares a normalized variant for model backends.
         normalized_crop = preprocess_face(face_crop)
         if normalized_crop is None:
             return self._no_face_result()
 
-        fer_emotion, fer_scores = detect_emotion_fer(normalized_crop)
+        fer_emotion, fer_scores = detect_emotion_fer(face_crop)
         if fer_emotion is None or not fer_scores:
             uncertain = {
                 "status": STATUS_HEAVY,
@@ -425,8 +438,10 @@ class EmotionDetectionPipeline:
             cache_last_result(self.state.cache, uncertain, current_time, self.state.frame_index, box_orig, current_signature)
             return uncertain
 
-        features = extract_features_mediapipe(normalized_crop, self.face_mesh_config)
-        face_quality = compute_face_quality(normalized_crop)
+        features = extract_features_mediapipe(face_crop, self.face_mesh_config)
+        if not features.get("available") and tracking_features.get("available"):
+            features = tracking_features
+        face_quality = compute_face_quality(face_crop)
         intelligence = self.engine.evaluate(fer_scores, features, current_time, face_quality=face_quality)
 
         result = {
@@ -500,6 +515,7 @@ class EmotionDetectionPipeline:
             print("ERROR: Camera is not initialized")
             return
 
+        self.session_start = time.time()
         print("Press 'q' to quit")
 
         while True:

@@ -3,3 +3,9 @@ deepface
 tf-keras
 mediapipe
 fer
+datasets
+scikit-learn
+matplotlib
+seaborn
+tqdm
+Pillow
