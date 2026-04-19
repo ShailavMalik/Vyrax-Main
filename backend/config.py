@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import cv2
+from pathlib import Path
+
+# Keep all backend file output rooted in this directory, no matter where
+# the process is launched from.
+BACKEND_DIR = Path(__file__).resolve().parent
+LOGS_DIR = BACKEND_DIR / "logs"
 
 # Camera and display
-CAMERA_INDEX = 0
+# On this machine, index 0 opens but often returns near-black frames.
+# Keep index 1 as the preferred source; runtime fallback still probes others.
+CAMERA_INDEX = 1
 DISPLAY_FRAME_WIDTH = 960
-SHOW_FPS = True
+SHOW_FPS = False
+SHOW_DEBUG_OVERLAY = False
+SHOW_CAMERA_QUALITY_OVERLAY = False
+SHOW_MESH_STATUS_TEXT = False
 
 # Face mesh overlay controls
 MESH_OVERLAY_DEFAULT = False
@@ -143,10 +154,11 @@ EMOTION_COLORS = {
 
 # Logging
 DEBUG_MODE = False
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "WARNING"
 ENABLE_JSONL_LOGGING = True
-JSONL_LOG_PATH = "logs/emotion_events.jsonl"
+JSONL_LOG_PATH = str(LOGS_DIR / "emotion_events.jsonl")
+EMOTION_LOG_PATH = str(LOGS_DIR / "emotion_logs.jsonl")
 
 # Benchmark mode
 DEFAULT_BENCHMARK_SECONDS = 30
-BENCHMARK_REPORT_PATH = "logs/benchmark_report.json"
+BENCHMARK_REPORT_PATH = str(LOGS_DIR / "benchmark_report.json")

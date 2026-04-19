@@ -64,6 +64,8 @@ except Exception:  # pragma: no cover
     DeepFace = None
 
 from config import (
+    EMOTION_LOG_PATH,
+    LOG_LEVEL,
     CONFIDENCE_CALIBRATION_POWER,
     EMA_ALPHA,
     EMOTION_HOLD_SECONDS,
@@ -131,15 +133,18 @@ from utils import clamp_box
 
 LOGGER = logging.getLogger("emotion_engine")
 if not LOGGER.handlers:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    _configured_level = getattr(logging, str(LOG_LEVEL).upper(), logging.WARNING)
+    logging.basicConfig(level=_configured_level, format="[%(levelname)s] %(message)s")
 
 
 def log_emotion_frame(data: dict) -> None:
-    """Append one structured frame record to emotion_logs.jsonl."""
+    """Append one structured frame record to the backend emotion JSONL log."""
     payload = dict(data)
     payload["timestamp"] = time.time()
     try:
-        with open("emotion_logs.jsonl", "a", encoding="utf-8") as file:
+        log_path = Path(EMOTION_LOG_PATH)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=True) + "\n")
     except Exception:
         # Logging must never interrupt realtime inference.

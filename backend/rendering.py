@@ -13,7 +13,6 @@ import numpy as np
 from typing import Dict, Tuple, Optional, List
 
 from config import (
-    BOX_COLOR,
     BOX_THICKNESS,
     BG_COLOR,
     BG_PADDING,
@@ -124,17 +123,3 @@ def draw_performance_metrics(frame: np.ndarray, fps: float,
         BG_COLOR,
         BG_PADDING
     )
-
-        text_y = min(frame.shape[0] - 10, y2 + 18)
-        for line in debug_lines:
-            cv2.putText(
-                frame,
-                line,
-                (x1, text_y),
-                FONT,
-                0.45,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
-            text_y = min(frame.shape[0] - 10, text_y + 15)

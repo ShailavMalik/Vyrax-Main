@@ -1,5 +1,0 @@
-opencv-python
-deepface
-tf-keras
-mediapipe
-fer

@@ -13,8 +13,8 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, cast
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -39,7 +39,11 @@ from config import (
     HEAVY_DETECTION_INTERVAL_SECONDS,
     JSONL_LOG_PATH,
     LANDMARK_CHANGE_THRESHOLD,
+    LOG_LEVEL,
+    SHOW_CAMERA_QUALITY_OVERLAY,
+    SHOW_DEBUG_OVERLAY,
     SHOW_FPS,
+    SHOW_MESH_STATUS_TEXT,
     TEXT_COLOR,
     TEXT_THICKNESS,
     BG_COLOR,
@@ -60,12 +64,13 @@ from config import (
     MESH_POINT_RADIUS,
     MESH_THICKNESS,
 )
+from camera_quality import CameraQualityAnalyzer
+from detection import detect_emotion_vit, init_vit_emotion_model
 from emotion_engine import (
     DetectionCache,
     EmotionIntelligenceEngine,
     cache_last_result,
     compute_face_quality,
-    detect_emotion_fer,
     detect_faces_mediapipe,
     extract_face,
     extract_features_mediapipe,
@@ -81,12 +86,19 @@ from utils import draw_text_with_bg, resize_to_width
 
 LOGGER = logging.getLogger("realtime_emotion")
 if not LOGGER.handlers:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    _configured_level = getattr(logging, str(LOG_LEVEL).upper(), logging.WARNING)
+    logging.basicConfig(level=_configured_level, format="[%(levelname)s] %(message)s")
 
 STATUS_TRACKING = "Tracking"
 STATUS_HEAVY = "Heavy inference"
 STATUS_NO_FACE = "No face"
 STATUS_UNCERTAIN = "uncertain"
+_CAPTURE_BACKENDS = [
+    getattr(cv2, "CAP_DSHOW", None),
+    getattr(cv2, "CAP_MSMF", None),
+    cv2.CAP_ANY,
+]
+_CAPTURE_INDEX_CANDIDATES = [0, 1, 2, 3]
 
 _MESH_SUPPORT_WARNED = False
 
@@ -302,38 +314,39 @@ def draw_results(frame: np.ndarray, result: Dict[str, Any], fps: float) -> None:
             BG_PADDING,
         )
 
-    panel_lines = [
-        f"Status: {status}",
-        f"Decision: {decision_source}",
-        f"Geometry: {geometry_emotion.upper()} {geometry_strength * 100:.0f}%",
-        f"Raw: {raw_emotion.upper()} {raw_confidence * 100:.0f}%",
-        f"Smoothed: {smoothed_emotion.upper()} {smoothed_confidence * 100:.0f}%",
-        f"Final: {final_emotion.upper()} {final_confidence * 100:.0f}%",
-        f"Intensity: {expression_intensity:.2f}",
-        f"IoT: {iot_emotion.upper()} hold {iot_hold_remaining:.1f}s",
-    ]
+    if SHOW_DEBUG_OVERLAY:
+        panel_lines = [
+            f"Status: {status}",
+            f"Decision: {decision_source}",
+            f"Geometry: {geometry_emotion.upper()} {geometry_strength * 100:.0f}%",
+            f"Raw: {raw_emotion.upper()} {raw_confidence * 100:.0f}%",
+            f"Smoothed: {smoothed_emotion.upper()} {smoothed_confidence * 100:.0f}%",
+            f"Final: {final_emotion.upper()} {final_confidence * 100:.0f}%",
+            f"Intensity: {expression_intensity:.2f}",
+            f"IoT: {iot_emotion.upper()} hold {iot_hold_remaining:.1f}s",
+        ]
 
-    triggers = result.get("rule_triggers") or []
-    if triggers:
-        panel_lines.append(f"Rules: {', '.join(triggers)}")
+        triggers = result.get("rule_triggers") or []
+        if triggers:
+            panel_lines.append(f"Rules: {', '.join(triggers)}")
 
-    y = 30
-    for line in panel_lines:
-        draw_text_with_bg(
-            frame,
-            line,
-            10,
-            y,
-            FONT,
-            FONT_SCALE,
-            TEXT_COLOR,
-            TEXT_THICKNESS,
-            BG_COLOR,
-            BG_PADDING,
-        )
-        y += 26
+        y = 30
+        for line in panel_lines:
+            draw_text_with_bg(
+                frame,
+                line,
+                10,
+                y,
+                FONT,
+                FONT_SCALE,
+                TEXT_COLOR,
+                TEXT_THICKNESS,
+                BG_COLOR,
+                BG_PADDING,
+            )
+            y += 26
 
-    if SHOW_FPS:
+    if SHOW_DEBUG_OVERLAY and SHOW_FPS:
         draw_text_with_bg(
             frame,
             f"FPS: {fps:.1f}",
@@ -346,6 +359,57 @@ def draw_results(frame: np.ndarray, result: Dict[str, Any], fps: float) -> None:
             BG_COLOR,
             BG_PADDING,
         )
+
+
+def draw_quality_overlay(
+    frame: np.ndarray,
+    metrics: Dict[str, float],
+    warnings_list: list[str],
+) -> None:
+    """Draw camera quality panel and actionable warnings."""
+    x = max(10, frame.shape[1] - 315)
+    y = 30
+
+    lines = [
+        f"Cam Quality: {metrics.get('quality_score', 0.0):.1f}",
+        f"Sharpness: {metrics.get('sharpness', 0.0):.1f}",
+        f"Brightness: {metrics.get('brightness', 0.0):.1f}",
+        f"Contrast: {metrics.get('contrast', 0.0):.1f}",
+        f"Noise: {metrics.get('noise', 0.0):.1f}",
+        f"FPS Score: {metrics.get('fps', 0.0):.1f}",
+        f"Face Ratio: {metrics.get('face_ratio', 0.0):.1f}%",
+        f"Detection: {metrics.get('detection_success', 0.0):.1f}%",
+    ]
+
+    for line in lines:
+        draw_text_with_bg(
+            frame,
+            line,
+            x,
+            y,
+            FONT,
+            FONT_SCALE,
+            TEXT_COLOR,
+            TEXT_THICKNESS,
+            BG_COLOR,
+            BG_PADDING,
+        )
+        y += 24
+
+    for warning_text in warnings_list:
+        draw_text_with_bg(
+            frame,
+            f"Warning: {warning_text}",
+            x,
+            y,
+            FONT,
+            FONT_SCALE,
+            (30, 30, 255),
+            TEXT_THICKNESS,
+            BG_COLOR,
+            BG_PADDING,
+        )
+        y += 24
 
 
 @dataclass
@@ -436,11 +500,20 @@ class JsonlEventLogger:
 
 
 class EmotionDetectionPipeline:
-    """Main loop: lightweight tracking every frame, heavy FER on triggers only."""
+    """Main loop: lightweight tracking every frame, heavy emotion inference on triggers only."""
 
-    def __init__(self, benchmark_seconds: int = 0, benchmark_report: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        benchmark_seconds: int = 0,
+        benchmark_report: Optional[str] = None,
+        camera_compare_mode: bool = False,
+        camera_label: str = "camera",
+        compare_seconds: int = 25,
+        quality_report: Optional[str] = None,
+    ) -> None:
         self.cap: Optional[cv2.VideoCapture] = None
         self.state = PipelineState(cache=DetectionCache(), last_fps_time=time.time())
+        init_vit_emotion_model()
         self.face_mesh_config = get_face_mesh_config()
         self.engine = EmotionIntelligenceEngine()
         self.feature_baseline: Optional[Dict[str, float]] = None
@@ -452,18 +525,88 @@ class EmotionDetectionPipeline:
         self.mesh_enabled = bool(MESH_OVERLAY_DEFAULT)
         self.mesh_landmarks_cache: Optional[Any] = None
         self.mesh_landmark_count: int = 0
+        self.quality_analyzer = CameraQualityAnalyzer(compute_every_n_frames=3)
+        self.latest_quality_metrics: Dict[str, float] = {
+            "sharpness": 0.0,
+            "brightness": 0.0,
+            "contrast": 0.0,
+            "noise": 0.0,
+            "fps": 0.0,
+            "face_ratio": 0.0,
+            "detection_success": 0.0,
+            "quality_score": 0.0,
+        }
+        self.latest_quality_warnings: list[str] = []
+        self.camera_compare_mode = bool(camera_compare_mode)
+        self.camera_label = camera_label.strip() or "camera"
+        self.compare_seconds = max(20, min(30, int(compare_seconds)))
+        self.quality_report = quality_report
 
     def initialize_camera(self) -> bool:
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
-        if not self.cap.isOpened():
-            print("ERROR: Could not open webcam")
-            return False
+        def frame_signal_score(frame: np.ndarray) -> float:
+            if frame is None or frame.size == 0:
+                return 0.0
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return float(gray.std() + (0.35 * gray.mean()))
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        print("Camera initialized")
-        return True
+        backends = [backend for backend in _CAPTURE_BACKENDS if backend is not None]
+        index_candidates = list(dict.fromkeys([CAMERA_INDEX, *_CAPTURE_INDEX_CANDIDATES]))
+        min_score = 12.0
+        min_good_reads = 5
+        best_cap: Optional[cv2.VideoCapture] = None
+        best_score = -1.0
+        best_meta = ""
+
+        for index in index_candidates:
+            for backend in backends:
+                cap = cv2.VideoCapture(index, backend)
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                backend_name = "CAP_DSHOW" if backend == getattr(cv2, "CAP_DSHOW", None) else (
+                    "CAP_MSMF" if backend == getattr(cv2, "CAP_MSMF", None) else "CAP_ANY"
+                )
+
+                good_reads = 0
+                signal_sum = 0.0
+                for _ in range(20):
+                    ok, frame = cap.read()
+                    if ok and frame is not None and frame.size > 0:
+                        good_reads += 1
+                        signal_sum += frame_signal_score(frame)
+
+                avg_signal = signal_sum / max(good_reads, 1)
+
+                if avg_signal > best_score:
+                    if best_cap is not None:
+                        best_cap.release()
+                    best_cap = cap
+                    best_score = avg_signal
+                    best_meta = f"index {index} with {backend_name}"
+                else:
+                    cap.release()
+
+                if good_reads >= min_good_reads and avg_signal >= min_score:
+                    self.cap = best_cap
+                    print(f"Camera initialized using {best_meta} (signal={best_score:.2f})")
+                    return True
+
+        if best_cap is not None and best_score >= min_score:
+            self.cap = best_cap
+            print(f"Camera initialized using {best_meta} (signal={best_score:.2f})")
+            return True
+
+        if best_cap is not None:
+            best_cap.release()
+
+        print("ERROR: Could not open a usable webcam")
+        return False
 
     def update_fps(self) -> float:
         now = time.time()
@@ -590,12 +733,12 @@ class EmotionDetectionPipeline:
         if face_crop is None:
             return self._no_face_result()
 
-        # Heavy pass uses normalized crop for FER and geometric features.
+        # Heavy pass uses normalized crop for model inference and geometric features.
         normalized_crop = preprocess_face(face_crop)
         if normalized_crop is None:
             return self._no_face_result()
 
-        fer_emotion, fer_scores = detect_emotion_fer(normalized_crop)
+        fer_emotion, fer_scores = detect_emotion_vit(normalized_crop)
         if fer_emotion is None or not fer_scores:
             uncertain = {
                 "status": STATUS_HEAVY,
@@ -684,8 +827,8 @@ class EmotionDetectionPipeline:
                 }
             )
 
-        LOGGER.info(
-            "FER raw=%s triggers=%s source=%s final=%s(%.2f) fps=%.1f",
+        LOGGER.debug(
+            "Model raw=%s triggers=%s source=%s final=%s(%.2f) fps=%.1f",
             result["scores"],
             result["rule_triggers"],
             result.get("decision_source", "SMOOTHED"),
@@ -699,29 +842,32 @@ class EmotionDetectionPipeline:
         if self.mesh_enabled and self.mesh_landmarks_cache is not None:
             draw_face_mesh_overlay(frame, self.mesh_landmarks_cache)
         draw_results(frame, result, self.update_fps())
+        if SHOW_CAMERA_QUALITY_OVERLAY:
+            draw_quality_overlay(frame, self.latest_quality_metrics, self.latest_quality_warnings)
 
-        mesh_state_text = (
-            f"MESH: ON ({self.mesh_landmark_count} pts)"
-            if self.mesh_enabled and self.mesh_landmark_count > 0
-            else ("MESH: ON (no landmarks)" if self.mesh_enabled else "MESH: OFF")
-        )
-        mesh_state_color = (
-            (70, 240, 120)
-            if self.mesh_enabled and self.mesh_landmark_count > 0
-            else ((0, 180, 255) if self.mesh_enabled else (140, 140, 140))
-        )
-        draw_text_with_bg(
-            frame,
-            mesh_state_text,
-            10,
-            frame.shape[0] - 16,
-            FONT,
-            FONT_SCALE,
-            mesh_state_color,
-            TEXT_THICKNESS,
-            BG_COLOR,
-            BG_PADDING,
-        )
+        if SHOW_MESH_STATUS_TEXT:
+            mesh_state_text = (
+                f"MESH: ON ({self.mesh_landmark_count} pts)"
+                if self.mesh_enabled and self.mesh_landmark_count > 0
+                else ("MESH: ON (no landmarks)" if self.mesh_enabled else "MESH: OFF")
+            )
+            mesh_state_color = (
+                (70, 240, 120)
+                if self.mesh_enabled and self.mesh_landmark_count > 0
+                else ((0, 180, 255) if self.mesh_enabled else (140, 140, 140))
+            )
+            draw_text_with_bg(
+                frame,
+                mesh_state_text,
+                10,
+                frame.shape[0] - 16,
+                FONT,
+                FONT_SCALE,
+                mesh_state_color,
+                TEXT_THICKNESS,
+                BG_COLOR,
+                BG_PADDING,
+            )
 
         return resize_to_width(frame, DISPLAY_FRAME_WIDTH)
 
@@ -731,6 +877,8 @@ class EmotionDetectionPipeline:
             return
 
         print("Press 'q' to quit | Press 'm' to toggle face mesh overlay")
+        if self.camera_compare_mode:
+            print(f"Camera comparison mode enabled for {self.compare_seconds}s (label='{self.camera_label}')")
 
         while True:
             ok, frame = self.cap.read()
@@ -739,12 +887,19 @@ class EmotionDetectionPipeline:
                 break
 
             result = self.process_frame(frame)
+            has_live_face = str(result.get("status", "")) != STATUS_NO_FACE
+            face_bbox = cast(Optional[Tuple[int, int, int, int]], result.get("box") if has_live_face else None)
+            self.latest_quality_metrics = self.quality_analyzer.update(frame, face_bbox, has_live_face)
+            self.latest_quality_warnings = self.quality_analyzer.warnings(self.latest_quality_metrics)
             self.benchmark_stats.record(result)
             annotated = self.render(frame, result)
             cv2.imshow("Real-Time Emotion Detection", annotated)
 
             if self.benchmark_seconds > 0 and (time.time() - self.session_start) >= self.benchmark_seconds:
                 print("Benchmark duration reached. Stopping run.")
+                break
+            if self.camera_compare_mode and (time.time() - self.session_start) >= self.compare_seconds:
+                print("Camera comparison session completed.")
                 break
 
             key = cv2.waitKey(1) & 0xFF
@@ -783,6 +938,7 @@ class EmotionDetectionPipeline:
     def _save_benchmark_report(self) -> None:
         elapsed = max(0.0, time.time() - self.session_start)
         summary = self.benchmark_stats.to_dict(elapsed)
+        quality_summary = self.quality_analyzer.session_summary(self.camera_label)
 
         if self.benchmark_seconds > 0:
             report_path = Path(self.benchmark_report)
@@ -790,8 +946,16 @@ class EmotionDetectionPipeline:
             report_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
             print(f"Benchmark report saved to: {report_path}")
 
+        if self.camera_compare_mode and self.quality_report:
+            quality_path = Path(self.quality_report)
+            quality_path.parent.mkdir(parents=True, exist_ok=True)
+            quality_path.write_text(json.dumps(quality_summary, indent=2), encoding="utf-8")
+            print(f"Camera quality report saved to: {quality_path}")
+
         print("Benchmark summary:")
         print(json.dumps(summary, indent=2))
+        print("Camera quality summary:")
+        print(json.dumps(quality_summary, indent=2))
 
     def cleanup(self) -> None:
         if self.cap is not None:
@@ -813,11 +977,38 @@ def main() -> None:
         default=BENCHMARK_REPORT_PATH,
         help="Path to benchmark JSON report",
     )
+    parser.add_argument(
+        "--camera-compare",
+        action="store_true",
+        help="Enable 20-30 second camera quality comparison session mode",
+    )
+    parser.add_argument(
+        "--camera-label",
+        type=str,
+        default="camera",
+        help="Label for camera session summary (e.g. laptop_webcam, usb_cam, mobile_cam)",
+    )
+    parser.add_argument(
+        "--compare-seconds",
+        type=int,
+        default=25,
+        help="Duration for comparison mode (clamped to 20-30 seconds)",
+    )
+    parser.add_argument(
+        "--quality-report",
+        type=str,
+        default="",
+        help="Optional path to save camera quality session summary JSON",
+    )
     args = parser.parse_args()
 
     pipeline = EmotionDetectionPipeline(
         benchmark_seconds=args.benchmark_seconds,
         benchmark_report=args.benchmark_report,
+        camera_compare_mode=bool(args.camera_compare),
+        camera_label=args.camera_label,
+        compare_seconds=args.compare_seconds,
+        quality_report=args.quality_report or None,
     )
     if not pipeline.initialize_camera():
         return

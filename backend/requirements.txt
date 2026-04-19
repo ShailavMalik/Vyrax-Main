@@ -1,0 +1,10 @@
+opencv-python
+flask
+flask-cors
+deepface
+tf-keras
+mediapipe
+fer
+transformers
+torch
+pillow
