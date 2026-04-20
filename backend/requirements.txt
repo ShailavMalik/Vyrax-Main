@@ -8,3 +8,5 @@ fer
 transformers
 torch
 pillow
+azure-storage-blob
+python-dotenv

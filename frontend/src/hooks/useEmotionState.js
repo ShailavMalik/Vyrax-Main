@@ -17,13 +17,64 @@ function normalizeEmotionLabel(rawEmotion) {
     return "uncertain";
   }
 
+  const aliases = {
+    happiness: "happy",
+    sadness: "sad",
+    anger: "angry",
+    surprise: "surprised",
+  };
+
+  if (aliases[value]) {
+    return aliases[value];
+  }
+
   return value;
+}
+
+function normalizeConfidence(rawValue) {
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+
+  // Backend confidence is currently returned as percentage (0..100).
+  if (numeric > 1) {
+    return Math.max(0, Math.min(numeric / 100, 1));
+  }
+
+  return Math.max(0, Math.min(numeric, 1));
+}
+
+function getTopScore(scores) {
+  if (!scores || typeof scores !== "object") {
+    return { label: null, value: null };
+  }
+
+  let bestLabel = null;
+  let bestValue = -Infinity;
+
+  Object.entries(scores).forEach(([label, value]) => {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > bestValue) {
+      bestLabel = label;
+      bestValue = numeric;
+    }
+  });
+
+  if (!bestLabel || !Number.isFinite(bestValue)) {
+    return { label: null, value: null };
+  }
+
+  return { label: bestLabel, value: bestValue };
 }
 
 function extractEmotionPayload(newData) {
   const status = normalizeStatus(newData?.status);
   const hasFace =
-    newData?.box ? true
+    newData?.face_detected === true ? true
+    : newData?.face_detected === false ? false
+    : newData?.face_box ? true
+    : newData?.box ? true
     : status === "no-face" ? false
     : undefined;
 
@@ -31,13 +82,20 @@ function extractEmotionPayload(newData) {
     newData?.emotion ?? newData?.final_emotion ?? newData?.smoothed_emotion,
   );
 
-  const confidenceValue =
+  const confidence = normalizeConfidence(
     newData?.confidence ??
-    newData?.final_confidence ??
-    newData?.smoothed_confidence ??
-    0;
-  const confidence =
-    Number.isFinite(Number(confidenceValue)) ? Number(confidenceValue) : 0;
+      newData?.final_confidence ??
+      newData?.smoothed_confidence ??
+      0,
+  );
+
+  const fpsValue = Number(newData?.fps);
+  const fps = Number.isFinite(fpsValue) ? fpsValue : null;
+  const topScore = getTopScore(newData?.scores ?? newData?.all_scores);
+
+  const topScoreValue = Number(topScore.value);
+  const normalizedTopScoreValue =
+    Number.isFinite(topScoreValue) ? normalizeConfidence(topScoreValue) : null;
 
   return {
     emotion,
@@ -47,6 +105,15 @@ function extractEmotionPayload(newData) {
     cameraReady: newData?.cameraReady ?? newData?.camera_ready,
     error: newData?.error || "",
     timestamp: Date.now(),
+    modelTelemetry: {
+      fps,
+      decisionSource: newData?.decision_source || "N/A",
+      geometryReason: newData?.geometry_reason || "N/A",
+      ruleTriggers:
+        Array.isArray(newData?.rule_triggers) ? newData.rule_triggers : [],
+      topScoreEmotion: topScore.label,
+      topScoreValue: normalizedTopScoreValue,
+    },
   };
 }
 
@@ -61,6 +128,14 @@ const initialState = {
   hasFace: undefined,
   cameraReady: false,
   error: "",
+  modelTelemetry: {
+    fps: null,
+    decisionSource: "N/A",
+    geometryReason: "N/A",
+    ruleTriggers: [],
+    topScoreEmotion: null,
+    topScoreValue: null,
+  },
   isDemo: false,
   sessionStartTime: Date.now(),
 };
@@ -68,6 +143,7 @@ const initialState = {
 const emotionReducer = (state, action) => {
   switch (action.type) {
     case "UPDATE_EMOTION": {
+      const now = action.payload.timestamp || Date.now();
       const nextHasFace =
         action.payload.hasFace !== undefined ?
           action.payload.hasFace
@@ -95,7 +171,7 @@ const emotionReducer = (state, action) => {
           shouldUpdateEmotion ? state.currentEmotion : state.previousEmotion,
         currentEmotion: nextEmotion,
         confidence: nextConfidence,
-        timestamp: action.payload.timestamp || Date.now(),
+        timestamp: now,
         status: action.payload.status || state.status,
         hasFace: nextHasFace,
         cameraReady:
@@ -103,6 +179,20 @@ const emotionReducer = (state, action) => {
             action.payload.cameraReady
           : state.cameraReady,
         error: action.payload.error || "",
+        modelTelemetry: (() => {
+          const nextTelemetry =
+            action.payload.modelTelemetry || state.modelTelemetry;
+          const previousTimestamp = state.timestamp || now;
+          const elapsedMs = Math.max(1, now - previousTimestamp);
+          const fallbackFps = Math.max(0, 1000 / elapsedMs);
+          return {
+            ...nextTelemetry,
+            fps:
+              Number.isFinite(nextTelemetry?.fps) ?
+                nextTelemetry.fps
+              : fallbackFps,
+          };
+        })(),
         emotionHistory: nextHistory,
       };
     }

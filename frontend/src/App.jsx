@@ -1,21 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion as Motion } from "framer-motion";
 import { useEmotionState } from "./hooks/useEmotionState";
-import { generateDemoData, buildDemoDebugData } from "./utils/emotionUtils";
 import CameraFeed from "./components/CameraFeed";
 import ConfidenceBar from "./components/ConfidenceBar";
 import EmotionPanel from "./components/EmotionPanel";
 import TransitionPanel from "./components/TransitionPanel";
 import MiniGraph from "./components/MiniGraph";
 import ModeToggle from "./components/ModeToggle";
-import DebugPanel from "./components/DebugPanel";
-import EmotionGraph from "./components/EmotionGraph";
 import InsightsPanel from "./components/InsightsPanel";
+import EmotionGraph from "./components/EmotionGraph";
 import SessionSummary from "./components/SessionSummary";
 
 const API_URL = "http://localhost:8000/emotion";
 const NORMAL_POLL_INTERVAL = 350;
-const DEMO_POLL_INTERVAL = 450;
 
 function App() {
   const {
@@ -25,17 +22,14 @@ function App() {
     emotionHistory,
     hasFace,
     error,
-    isDemo,
+    modelTelemetry,
     sessionStartTime,
     updateEmotionData,
-    setDemoMode,
     setError,
     clearHistory,
   } = useEmotionState();
   const [connected, setConnected] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
-  const [demoDebug, setDemoDebug] = useState(() => buildDemoDebugData("neutral", 0));
-  const demoSequenceIndexRef = useRef(0);
   const pollIntervalRef = useRef(null);
 
   // Fetch emotion data from backend in normal mode
@@ -57,22 +51,9 @@ function App() {
     }
   }, [updateEmotionData, cameraEnabled, setError]);
 
-  // Generate demo data in demo mode
-  const fetchEmotionDemo = useCallback(() => {
-    try {
-      const demoData = generateDemoData(demoSequenceIndexRef.current);
-      demoSequenceIndexRef.current = (demoSequenceIndexRef.current + 1) % 8; // Demo sequence cycles every 8 items
-      setConnected(true);
-      updateEmotionData(demoData);
-      setDemoDebug(buildDemoDebugData(demoData.emotion, demoData.confidence));
-    } catch (error) {
-      setError("Demo mode error");
-    }
-  }, [updateEmotionData, setError]);
-
-  // Start polling with the appropriate interval
+  // Start normal polling loop
   useEffect(() => {
-    if (!cameraEnabled && !isDemo) {
+    if (!cameraEnabled) {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
       }
@@ -81,40 +62,27 @@ function App() {
       return;
     }
 
-    if (isDemo) {
-      fetchEmotionDemo();
-      pollIntervalRef.current = setInterval(
-        fetchEmotionDemo,
-        DEMO_POLL_INTERVAL,
-      );
-    } else {
-      fetchEmotionNormal();
-      pollIntervalRef.current = setInterval(
-        fetchEmotionNormal,
-        NORMAL_POLL_INTERVAL,
-      );
-    }
+    fetchEmotionNormal();
+    pollIntervalRef.current = setInterval(
+      fetchEmotionNormal,
+      NORMAL_POLL_INTERVAL,
+    );
 
     return () => {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
       }
     };
-  }, [cameraEnabled, isDemo, fetchEmotionNormal, fetchEmotionDemo, setError]);
-
-  const handleToggleDemoMode = (newMode) => {
-    setDemoMode(newMode);
-  };
+  }, [cameraEnabled, fetchEmotionNormal, setError]);
 
   const handleClearSession = () => {
     clearHistory();
   };
 
-  const isDemoMode = isDemo;
-
   return (
     <div className="relative min-h-screen overflow-x-hidden px-3 py-3 text-slate-100 sm:px-5 lg:px-6 lg:py-4">
       <div className="aurora-bg pointer-events-none absolute inset-0" />
+      <div className="scanline-overlay" />
 
       <Motion.div
         className="pointer-events-none absolute -left-16 top-24 h-52 w-52 rounded-full bg-cyan-400/20 blur-3xl"
@@ -134,33 +102,35 @@ function App() {
         transition={{ duration: 0.65, ease: "easeOut" }}>
         <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p className="font-body text-xs uppercase tracking-[0.45em] text-cyan-200/75">
+            <p className="font-body text-[11px] uppercase tracking-[0.5em] text-cyan-200/70">
               Vyra-X Neural Console
             </p>
-            <h1 className="mt-1 font-heading text-2xl uppercase tracking-[0.12em] text-slate-100 sm:text-3xl lg:text-4xl">
+            <h1 className="cyber-title mt-1 font-heading text-2xl uppercase sm:text-3xl lg:text-4xl">
               AI Emotion Cockpit
             </h1>
+            <p className="mt-1 text-[10px] uppercase tracking-[0.28em] text-cyan-100/55">
+              Real-time affect telemetry
+            </p>
           </div>
           <ModeToggle
-            demoMode={isDemoMode}
             cameraEnabled={cameraEnabled}
-            onToggleMode={handleToggleDemoMode}
             onToggleCamera={setCameraEnabled}
           />
         </header>
 
-        <section className="grid h-[calc(100vh-140px)] min-h-[620px] gap-4 overflow-hidden lg:grid-cols-[1.5fr_1fr]">
-          <div className="h-full min-h-0">
+        <section className="grid flex-1 min-h-0 gap-4 lg:grid-cols-[1.5fr_1fr]">
+          <div className="min-h-0">
             <CameraFeed
               cameraEnabled={cameraEnabled}
               hasFace={hasFace}
               currentEmotion={currentEmotion}
               confidence={confidence}
               cameraError={!cameraEnabled ? "" : error}
+              modelTelemetry={modelTelemetry}
             />
           </div>
 
-          <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
+          <div className="flex min-h-0 flex-col gap-2.5 lg:gap-3">
             <EmotionPanel
               emotion={currentEmotion}
               cameraEnabled={cameraEnabled}
@@ -180,9 +150,8 @@ function App() {
               emotionHistory={emotionHistory}
               compact
               connected={connected}
+              ledEmotion={currentEmotion}
             />
-
-            {isDemoMode && <DebugPanel debug={demoDebug} />}
           </div>
         </section>
 

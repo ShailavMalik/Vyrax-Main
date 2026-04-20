@@ -1,8 +1,19 @@
 import { motion as Motion } from "framer-motion";
 import { analyzeEmotionPattern, getEmotionColor } from "../utils/emotionUtils";
 
-function InsightsPanel({ emotionHistory, compact = false, connected = true }) {
+function InsightsPanel({
+  emotionHistory,
+  compact = false,
+  connected = true,
+  ledEmotion = "neutral",
+}) {
   const analysis = analyzeEmotionPattern(emotionHistory);
+  const ledColor = getEmotionColor(
+    ledEmotion || analysis.dominantEmotion || "neutral",
+  );
+  const ledLabel = String(
+    ledEmotion || analysis.dominantEmotion || "neutral",
+  ).toUpperCase();
 
   const getStabilityIcon = (stability) => {
     switch (stability) {
@@ -36,7 +47,8 @@ function InsightsPanel({ emotionHistory, compact = false, connected = true }) {
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.6 }}>
-      <p className={`${compact ? "text-[10px] tracking-[0.26em]" : "text-xs tracking-[0.38em]"} uppercase text-cyan-200/70`}>
+      <p
+        className={`${compact ? "text-[10px] tracking-[0.26em]" : "text-xs tracking-[0.38em]"} uppercase text-cyan-200/70`}>
         AI Insights
       </p>
 
@@ -54,23 +66,33 @@ function InsightsPanel({ emotionHistory, compact = false, connected = true }) {
         <div className="grid grid-cols-3 gap-2">
           <div className="rounded-lg border border-slate-300/20 bg-slate-800/50 p-2.5">
             <p className="text-[10px] text-slate-400">Dominant</p>
-            <p className="mt-1 text-sm font-bold" style={{ color: getEmotionColor(analysis.dominantEmotion) }}>
+            <p
+              className="mt-1 text-sm font-bold"
+              style={{ color: getEmotionColor(analysis.dominantEmotion) }}>
               {analysis.dominantEmotion}
             </p>
           </div>
 
           <div className="rounded-lg border border-slate-300/20 bg-slate-800/50 p-2.5">
             <p className="text-[10px] text-slate-400">Stability</p>
-            <p className={`mt-1 text-sm font-bold ${getStabilityColor(analysis.stability)}`}>
+            <p
+              className={`mt-1 text-sm font-bold ${getStabilityColor(analysis.stability)}`}>
               {getStabilityIcon(analysis.stability)} {analysis.stability}
             </p>
           </div>
 
           <div className="rounded-lg border border-slate-300/20 bg-slate-800/50 p-2.5">
-            <p className="text-[10px] text-slate-400">System</p>
-            <p className={`mt-1 text-sm font-bold ${connected ? "text-emerald-300" : "text-rose-300"}`}>
-              {connected ? "online" : "offline"}
-            </p>
+            <p className="text-[10px] text-slate-400">ESP LED</p>
+            <div className="mt-1 flex items-center gap-2">
+              <span
+                className={`h-3 w-3 rounded-full shadow-[0_0_14px_rgba(255,255,255,0.15)] ${connected ? "" : "bg-slate-500"}`}
+                style={connected ? { backgroundColor: ledColor } : undefined}
+              />
+              <p
+                className={`text-sm font-bold ${connected ? "text-slate-100" : "text-rose-300"}`}>
+                {connected ? `${ledLabel} LED` : "offline"}
+              </p>
+            </div>
           </div>
         </div>
 
@@ -86,8 +108,12 @@ function InsightsPanel({ emotionHistory, compact = false, connected = true }) {
                     (count / emotionHistory.length) * 100,
                   );
                   return (
-                    <div key={emotion} className="flex items-center justify-between">
-                      <span className="text-xs capitalize text-slate-400">{emotion}</span>
+                    <div
+                      key={emotion}
+                      className="flex items-center justify-between">
+                      <span className="text-xs capitalize text-slate-400">
+                        {emotion}
+                      </span>
                       <div className="flex items-center gap-2">
                         <div className="h-2 w-24 rounded-full bg-slate-700">
                           <div

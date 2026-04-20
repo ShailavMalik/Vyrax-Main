@@ -12,10 +12,18 @@ import threading
 import time
 import logging
 import warnings
+import base64
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 from pathlib import Path
 import sys
+from datetime import datetime, timezone
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency at import time
+    load_dotenv = None
 
 # Keep runtime logs concise for launcher mode while preserving errors.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -50,21 +58,36 @@ except Exception:
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, stream_with_context
+from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+REPO_ROOT = BACKEND_DIR.parent
+if load_dotenv is not None:
+    load_dotenv(REPO_ROOT / ".env", override=False)
+    load_dotenv(BACKEND_DIR / ".env", override=False)
+
 try:
     from .realtime_emotion import EmotionDetectionPipeline, STATUS_NO_FACE, STATUS_UNCERTAIN
 except ImportError:  # pragma: no cover - script execution path
     from realtime_emotion import EmotionDetectionPipeline, STATUS_NO_FACE, STATUS_UNCERTAIN
 
+try:
+    from .snapshot_storage import AsyncCleanupScheduler, SnapshotRepository, build_container_client
+except ImportError:  # pragma: no cover - script execution path
+    from snapshot_storage import AsyncCleanupScheduler, SnapshotRepository, build_container_client
 
-HOST = "0.0.0.0"
-PORT = 8000
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+
+AZURE_BLOB_CONNECTION_STRING = os.getenv("AZURE_BLOB_CONNECTION_STRING", "")
+AZURE_BLOB_CONTAINER = os.getenv("AZURE_BLOB_CONTAINER", "vyra-snapshots")
+SNAPSHOT_BLOB_PREFIX = os.getenv("SNAPSHOT_BLOB_PREFIX", "snapshots")
+SNAPSHOT_CLEANUP_EVERY_UPLOADS = max(1, int(os.getenv("SNAPSHOT_CLEANUP_EVERY_UPLOADS", "1")))
 
 
 @dataclass
@@ -80,6 +103,9 @@ pipeline: Optional[EmotionDetectionPipeline] = None
 state = SharedState()
 state_lock = threading.Lock()
 stop_event = threading.Event()
+snapshot_container_client = None
+snapshot_repo: Optional[SnapshotRepository] = None
+snapshot_cleanup_scheduler = AsyncCleanupScheduler(run_every_uploads=SNAPSHOT_CLEANUP_EVERY_UPLOADS)
 
 
 def _make_placeholder_frame(message: str) -> bytes:
@@ -95,6 +121,48 @@ def _make_placeholder_frame(message: str) -> bytes:
 def _encode_frame(frame: np.ndarray) -> bytes:
     ok, buffer = cv2.imencode(".jpg", frame)
     return buffer.tobytes() if ok else b""
+
+
+def _parse_data_url(payload: str) -> tuple[str, bytes]:
+    content_type = "image/jpeg"
+    b64_payload = payload
+    if payload.startswith("data:") and "," in payload:
+        header, b64_payload = payload.split(",", 1)
+        if ";" in header:
+            content_type = header[5:].split(";", 1)[0] or content_type
+
+    image_bytes = base64.b64decode(b64_payload, validate=False)
+    if not image_bytes:
+        raise ValueError("Empty image payload")
+    return content_type, image_bytes
+
+
+def _extension_for_content_type(content_type: str) -> str:
+    mapping = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }
+    return mapping.get(content_type.lower(), "jpg")
+
+
+def _get_snapshot_services():
+    global snapshot_container_client, snapshot_repo
+
+    if not AZURE_BLOB_CONNECTION_STRING:
+        raise RuntimeError("Missing AZURE_BLOB_CONNECTION_STRING")
+
+    if snapshot_container_client is None:
+        snapshot_container_client = build_container_client(
+            connection_string=AZURE_BLOB_CONNECTION_STRING,
+            container_name=AZURE_BLOB_CONTAINER,
+        )
+
+    if snapshot_repo is None:
+        snapshot_repo = SnapshotRepository(BACKEND_DIR / "logs" / "snapshots.db")
+
+    return snapshot_container_client, snapshot_repo
 
 
 def _capture_loop() -> None:
@@ -293,6 +361,61 @@ def video_feed():
         stream_with_context(_mjpeg_stream()),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.post("/snapshot")
+def upload_snapshot():
+    payload = request.get_json(silent=True) or {}
+    image_payload = payload.get("image")
+    if not image_payload or not isinstance(image_payload, str):
+        return jsonify({"error": "Missing 'image' base64 payload"}), 400
+
+    try:
+        content_type, image_bytes = _parse_data_url(image_payload)
+    except Exception as exc:
+        return jsonify({"error": f"Invalid image payload: {exc}"}), 400
+
+    try:
+        container_client, repo = _get_snapshot_services()
+
+        snapshot_cleanup_scheduler.schedule(
+            container_client=container_client,
+            snapshot_repo=repo,
+            logger=logging.getLogger("web_app"),
+        )
+
+        now = datetime.now(timezone.utc)
+        ext = _extension_for_content_type(content_type)
+        prefix = SNAPSHOT_BLOB_PREFIX.strip("/")
+        blob_name = f"{prefix}/{now:%Y/%m/%d}/{uuid.uuid4().hex}.{ext}"
+
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            image_bytes,
+            overwrite=False,
+            content_type=content_type,
+        )
+
+        blob_url = blob_client.url
+        repo.upsert_snapshot(
+            blob_name=blob_name,
+            blob_url=blob_url,
+            content_length=len(image_bytes),
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "blob_name": blob_name,
+                "url": blob_url,
+                "content_type": content_type,
+                "size_bytes": len(image_bytes),
+            }
+        ), 201
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error": f"Snapshot upload failed: {exc}"}), 500
 
 
 def main() -> None:

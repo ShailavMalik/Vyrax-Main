@@ -34,7 +34,7 @@ function EmotionPanel({ emotion, cameraEnabled, hasFace }) {
     : getEmotionColor(emotionKey);
 
   return (
-    <section className="glass-panel relative overflow-hidden rounded-2xl border border-cyan-200/25 p-4 lg:p-5">
+    <section className="glass-panel panel-chrome relative flex-none overflow-hidden rounded-2xl border border-cyan-200/25 p-3 min-h-[96px] lg:min-h-[108px] lg:p-4">
       <Motion.div
         className="pointer-events-none absolute inset-0 opacity-25 blur-2xl"
         style={{ backgroundColor: glowColor }}
@@ -53,10 +53,12 @@ function EmotionPanel({ emotion, cameraEnabled, hasFace }) {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.25 }}
-            className="mt-2 flex items-end gap-3">
-            <span className="text-3xl lg:text-4xl">{display.icon}</span>
+            className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 pb-0.5">
+            <span className="text-2xl leading-none lg:text-3xl">
+              {display.icon}
+            </span>
             <h2
-              className="font-heading text-3xl leading-none tracking-[0.12em] lg:text-4xl"
+              className="min-w-0 max-w-full break-words pr-1 font-heading text-[clamp(1.05rem,1.9vw,1.7rem)] leading-[1.15] tracking-[0.07em] sm:text-[clamp(1.2rem,2vw,1.95rem)]"
               style={{
                 color: glowColor,
                 textShadow: `0 0 18px ${glowColor}90`,

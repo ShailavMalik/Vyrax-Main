@@ -27,3 +27,8 @@ dist/
 .vscode/
 .DS_Store
 datasets/
+
+# Local environment files
+.env
+.env.*
+!.env.example
