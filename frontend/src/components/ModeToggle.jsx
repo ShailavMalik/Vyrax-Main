@@ -17,7 +17,13 @@ function PillButton({ active, onClick, label, compact = false }) {
   );
 }
 
-function ModeToggle({ cameraEnabled, onToggleCamera }) {
+function ModeToggle({
+  cameraEnabled,
+  onToggleCamera,
+  onManualSnapshot,
+  manualSnapshotBusy = false,
+  manualSnapshotEnabled = false,
+}) {
   return (
     <section className="glass-panel panel-chrome rounded-2xl border border-cyan-200/20 p-2.5 lg:p-3">
       <div className="flex items-center gap-2">
@@ -31,6 +37,17 @@ function ModeToggle({ cameraEnabled, onToggleCamera }) {
           label={cameraEnabled ? "Cam On" : "Cam Off"}
           compact
         />
+        <Motion.button
+          type="button"
+          whileHover={
+            manualSnapshotEnabled ? { y: -1, scale: 1.01 } : undefined
+          }
+          whileTap={manualSnapshotEnabled ? { scale: 0.98 } : undefined}
+          onClick={onManualSnapshot}
+          disabled={!manualSnapshotEnabled}
+          className={`rounded-full border px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.13em] transition-all lg:text-[10px] ${manualSnapshotEnabled ? "border-amber-300/60 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25" : "cursor-not-allowed border-slate-300/20 bg-slate-900/35 text-slate-400"}`}>
+          {manualSnapshotBusy ? "Saving..." : "Manual Snap"}
+        </Motion.button>
       </div>
     </section>
   );

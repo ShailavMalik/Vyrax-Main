@@ -74,7 +74,16 @@ try {
 
         $states = @($backendJob.State, $frontendJob.State)
         if ($states -contains 'Failed' -or $states -contains 'Stopped' -or $states -contains 'Completed') {
-            Write-Host "One process exited. Stopping remaining process." -ForegroundColor Yellow
+            Write-Host "A process exited. backend=$($backendJob.State), frontend=$($frontendJob.State). Stopping remaining process." -ForegroundColor Yellow
+
+            if ($backendJob.State -ne 'Running') {
+                Write-Host "Backend job is $($backendJob.State)." -ForegroundColor DarkYellow
+            }
+
+            if ($frontendJob.State -ne 'Running') {
+                Write-Host "Frontend job is $($frontendJob.State)." -ForegroundColor DarkYellow
+            }
+
             break
         }
 

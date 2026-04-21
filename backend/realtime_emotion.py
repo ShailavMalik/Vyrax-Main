@@ -28,6 +28,8 @@ except Exception:  # pragma: no cover
 from config import (
     BENCHMARK_REPORT_PATH,
     CAMERA_INDEX,
+    CAMERA_CAPTURE_HEIGHT,
+    CAMERA_CAPTURE_WIDTH,
     DEFAULT_BENCHMARK_SECONDS,
     DETECTION_FRAME_SIZE,
     DISPLAY_FRAME_WIDTH,
@@ -39,6 +41,7 @@ from config import (
     HEAVY_DETECTION_INTERVAL_SECONDS,
     JSONL_LOG_PATH,
     LANDMARK_CHANGE_THRESHOLD,
+    LANDMARK_TRIGGER_MIN_INTERVAL_SECONDS,
     LOG_LEVEL,
     SHOW_CAMERA_QUALITY_OVERLAY,
     SHOW_DEBUG_OVERLAY,
@@ -63,6 +66,7 @@ from config import (
     MESH_OVERLAY_DEFAULT,
     MESH_POINT_RADIUS,
     MESH_THICKNESS,
+    TRACKING_LANDMARK_EVERY_N_FRAMES,
 )
 from camera_quality import CameraQualityAnalyzer
 from detection import detect_emotion_vit, init_vit_emotion_model
@@ -541,6 +545,8 @@ class EmotionDetectionPipeline:
         self.camera_label = camera_label.strip() or "camera"
         self.compare_seconds = max(20, min(30, int(compare_seconds)))
         self.quality_report = quality_report
+        self._last_tracking_signature: Optional[Tuple[float, float, float, float]] = None
+        self._last_tracking_features: Dict[str, Any] = {}
 
     def initialize_camera(self) -> bool:
         def frame_signal_score(frame: np.ndarray) -> float:
@@ -564,8 +570,8 @@ class EmotionDetectionPipeline:
                     cap.release()
                     continue
 
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_CAPTURE_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_CAPTURE_HEIGHT)
                 cap.set(cv2.CAP_PROP_FPS, 30)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -675,21 +681,42 @@ class EmotionDetectionPipeline:
         orig_h, orig_w = frame.shape[:2]
         small_w, small_h = DETECTION_FRAME_SIZE
         small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        tracking_frame = small
+        tracking_box: Optional[Tuple[int, int, int, int]] = None
 
         detections = detect_faces_mediapipe(small)
-        if not detections:
-            return self._no_face_result()
+        if detections:
+            sx1, sy1, sx2, sy2, det_score = detections[0]
+            tracking_box = (sx1, sy1, sx2, sy2)
+            box_orig = scale_box_to_original((sx1, sy1, sx2, sy2), (small_h, small_w), (orig_h, orig_w))
+            if box_orig is None:
+                return self._no_face_result()
+        else:
+            # Fallback: retry detection on full-resolution frame when downscaled pass misses.
+            full_detections = detect_faces_mediapipe(frame)
+            if not full_detections:
+                return self._no_face_result()
 
-        sx1, sy1, sx2, sy2, det_score = detections[0]
-        box_orig = scale_box_to_original((sx1, sy1, sx2, sy2), (small_h, small_w), (orig_h, orig_w))
-        if box_orig is None:
-            return self._no_face_result()
+            fx1, fy1, fx2, fy2, det_score = full_detections[0]
+            box_orig = (fx1, fy1, fx2, fy2)
+            tracking_frame = frame
+            tracking_box = (fx1, fy1, fx2, fy2)
 
         # Lightweight per-frame tracking signal.
-        tracking_crop = extract_face(small, (sx1, sy1, sx2, sy2), face_size=(128, 128), padding=8)
-        tracking_features = extract_features_mediapipe(tracking_crop, self.face_mesh_config) if tracking_crop is not None else {}
+        if tracking_box is None:
+            return self._no_face_result()
+
+        tracking_crop = extract_face(tracking_frame, tracking_box, face_size=(128, 128), padding=8)
+        should_refresh_tracking_landmarks = (self.state.frame_index % max(1, int(TRACKING_LANDMARK_EVERY_N_FRAMES))) == 0
+        if should_refresh_tracking_landmarks and tracking_crop is not None:
+            tracking_features = extract_features_mediapipe(tracking_crop, self.face_mesh_config)
+            self._last_tracking_features = tracking_features
+            self._last_tracking_signature = landmark_signature(tracking_features)
+        else:
+            tracking_features = self._last_tracking_features
+
         self._update_feature_baseline(tracking_features)
-        current_signature = landmark_signature(tracking_features)
+        current_signature = self._last_tracking_signature
 
         movement = face_movement_detected(self.state.cache.last_box, box_orig, FACE_MOVEMENT_THRESHOLD_PX)
         lm_change = landmark_changed(
@@ -697,6 +724,8 @@ class EmotionDetectionPipeline:
             current_signature,
             threshold=LANDMARK_CHANGE_THRESHOLD,
         )
+        if lm_change and (current_time - self.state.cache.last_detection_time) < float(LANDMARK_TRIGGER_MIN_INTERVAL_SECONDS):
+            lm_change = False
 
         run_heavy = should_run_detection(
             current_time,

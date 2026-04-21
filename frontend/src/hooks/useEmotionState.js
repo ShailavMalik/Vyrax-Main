@@ -92,6 +92,14 @@ function extractEmotionPayload(newData) {
   const fpsValue = Number(newData?.fps);
   const fps = Number.isFinite(fpsValue) ? fpsValue : null;
   const topScore = getTopScore(newData?.scores ?? newData?.all_scores);
+  const snapshotTaken = Boolean(
+    newData?.snapshot_taken ?? newData?.snapshotTaken,
+  );
+  const snapshotTakenAtValue = Number(
+    newData?.snapshot_taken_at ?? newData?.snapshotTakenAt,
+  );
+  const snapshotTakenAt =
+    Number.isFinite(snapshotTakenAtValue) ? snapshotTakenAtValue : null;
 
   const topScoreValue = Number(topScore.value);
   const normalizedTopScoreValue =
@@ -107,6 +115,10 @@ function extractEmotionPayload(newData) {
     timestamp: Date.now(),
     modelTelemetry: {
       fps,
+      snapshotTaken,
+      snapshotTakenAt,
+      snapshotReason: newData?.snapshot_reason || newData?.snapshotReason || "",
+      snapshotUrl: newData?.snapshot_url || newData?.snapshotUrl || "",
       decisionSource: newData?.decision_source || "N/A",
       geometryReason: newData?.geometry_reason || "N/A",
       ruleTriggers:
@@ -130,6 +142,10 @@ const initialState = {
   error: "",
   modelTelemetry: {
     fps: null,
+    snapshotTaken: false,
+    snapshotTakenAt: null,
+    snapshotReason: "",
+    snapshotUrl: "",
     decisionSource: "N/A",
     geometryReason: "N/A",
     ruleTriggers: [],
@@ -182,15 +198,20 @@ const emotionReducer = (state, action) => {
         modelTelemetry: (() => {
           const nextTelemetry =
             action.payload.modelTelemetry || state.modelTelemetry;
-          const previousTimestamp = state.timestamp || now;
-          const elapsedMs = Math.max(1, now - previousTimestamp);
-          const fallbackFps = Math.max(0, 1000 / elapsedMs);
           return {
             ...nextTelemetry,
             fps:
               Number.isFinite(nextTelemetry?.fps) ?
                 nextTelemetry.fps
-              : fallbackFps,
+              : (state.modelTelemetry?.fps ?? null),
+            snapshotTakenAt:
+              Number.isFinite(nextTelemetry?.snapshotTakenAt) ?
+                nextTelemetry.snapshotTakenAt
+              : (state.modelTelemetry?.snapshotTakenAt ?? null),
+            snapshotTaken:
+              typeof nextTelemetry?.snapshotTaken === "boolean" ?
+                nextTelemetry.snapshotTaken
+              : (state.modelTelemetry?.snapshotTaken ?? false),
           };
         })(),
         emotionHistory: nextHistory,

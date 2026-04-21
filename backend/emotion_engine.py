@@ -600,9 +600,22 @@ class EmotionIntelligenceEngine:
                 rules.append("landmark_trigger")
 
         if uncertain:
-            final_emotion = "uncertain"
-            decision_source = "UNCERTAIN"
-            decision_reason = "uncertain_low_confidence"
+            # Recover from borderline uncertainty when the face is clear and
+            # raw signal is still reasonably strong.
+            if raw_top_emotion is not None and raw_top_conf >= 0.28 and face_quality >= 0.55:
+                recovered_emotion = stable_emotion or raw_top_emotion
+                final_emotion = recovered_emotion
+                final_conf = max(float(final_conf), float(raw_top_conf) * 0.9)
+                uncertain = False
+                status = "ok"
+                debug_reason = "uncertain_recovered_good_quality"
+                decision_source = "UNCERTAIN_RECOVERED"
+                decision_reason = "recovered_from_raw_with_good_face_quality"
+                rules.append("uncertain_recovered_good_quality")
+            else:
+                final_emotion = "uncertain"
+                decision_source = "UNCERTAIN"
+                decision_reason = "uncertain_low_confidence"
 
         LOGGER.info(
             {
@@ -1117,8 +1130,8 @@ def _init_mediapipe_face_detector() -> Dict[str, Any]:
 
     solutions = getattr(mp, "solutions", None)
     if solutions is not None and hasattr(solutions, "face_detection"):
-        detector_short = solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.25)
-        detector_full = solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.20)
+        detector_short = solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.15)
+        detector_full = solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.10)
         return {"mode": "solutions", "detectors": [detector_short, detector_full]}
 
     try:
@@ -1131,7 +1144,7 @@ def _init_mediapipe_face_detector() -> Dict[str, Any]:
         options = vision.FaceDetectorOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=vision.RunningMode.IMAGE,
-            min_detection_confidence=0.20,
+            min_detection_confidence=0.10,
         )
         detector = vision.FaceDetector.create_from_options(options)
         return {"mode": "tasks", "detector": detector}

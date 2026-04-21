@@ -12,7 +12,8 @@ import EmotionGraph from "./components/EmotionGraph";
 import SessionSummary from "./components/SessionSummary";
 
 const API_URL = "http://localhost:8000/emotion";
-const NORMAL_POLL_INTERVAL = 350;
+const API_BASE = "http://localhost:8000";
+const NORMAL_POLL_INTERVAL = 500;
 
 function App() {
   const {
@@ -30,6 +31,7 @@ function App() {
   } = useEmotionState();
   const [connected, setConnected] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [manualSnapshotBusy, setManualSnapshotBusy] = useState(false);
   const pollIntervalRef = useRef(null);
 
   // Fetch emotion data from backend in normal mode
@@ -75,6 +77,59 @@ function App() {
     };
   }, [cameraEnabled, fetchEmotionNormal, setError]);
 
+  useEffect(() => {
+    const syncCameraState = async () => {
+      try {
+        await fetch(`${API_BASE}/api/camera-state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: cameraEnabled }),
+        });
+      } catch {
+        // Backend sync failure should not block local UI toggle state.
+      }
+    };
+
+    syncCameraState();
+  }, [cameraEnabled]);
+
+  const handleManualSnapshot = useCallback(async () => {
+    if (!cameraEnabled || manualSnapshotBusy) {
+      return;
+    }
+
+    setManualSnapshotBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/manual-snapshot`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "ui-session",
+          emotion: currentEmotion,
+          confidence,
+          timestamp: new Date().toISOString(),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Manual snapshot failed (${response.status})`);
+      }
+
+      await fetchEmotionNormal();
+    } catch {
+      setError("Manual snapshot failed");
+    } finally {
+      setManualSnapshotBusy(false);
+    }
+  }, [
+    cameraEnabled,
+    confidence,
+    currentEmotion,
+    fetchEmotionNormal,
+    manualSnapshotBusy,
+    setError,
+  ]);
+
   const handleClearSession = () => {
     clearHistory();
   };
@@ -115,6 +170,11 @@ function App() {
           <ModeToggle
             cameraEnabled={cameraEnabled}
             onToggleCamera={setCameraEnabled}
+            onManualSnapshot={handleManualSnapshot}
+            manualSnapshotBusy={manualSnapshotBusy}
+            manualSnapshotEnabled={
+              cameraEnabled && hasFace !== false && !manualSnapshotBusy
+            }
           />
         </header>
 
@@ -127,6 +187,8 @@ function App() {
               confidence={confidence}
               cameraError={!cameraEnabled ? "" : error}
               modelTelemetry={modelTelemetry}
+              onManualSnapshot={handleManualSnapshot}
+              manualSnapshotBusy={manualSnapshotBusy}
             />
           </div>
 

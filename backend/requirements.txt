@@ -9,4 +9,6 @@ transformers
 torch
 pillow
 azure-storage-blob
+torchvision
 python-dotenv
+pymongo
