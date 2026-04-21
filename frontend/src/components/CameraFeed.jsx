@@ -8,8 +8,6 @@ function CameraFeed({
   confidence,
   cameraError,
   modelTelemetry,
-  onManualSnapshot,
-  manualSnapshotBusy = false,
 }) {
   const emotionLabel = (currentEmotion || "neutral").toUpperCase();
   const [streamErrored, setStreamErrored] = useState(false);
@@ -30,15 +28,11 @@ function CameraFeed({
     Boolean(modelTelemetry?.snapshotTaken) && Number.isFinite(snapshotTakenAt) ?
       Date.now() - snapshotTakenAt < 1800
     : false;
+  const snapshotFlashKey = Number.isFinite(snapshotTakenAt) ? snapshotTakenAt : 0;
   const snapshotReason = (modelTelemetry?.snapshotReason || "").replaceAll(
     "_",
     " ",
   );
-  const snapshotReady =
-    cameraEnabled &&
-    hasFace !== false &&
-    !manualSnapshotBusy &&
-    typeof onManualSnapshot === "function";
   const topScoreEmotion = modelTelemetry?.topScoreEmotion || "N/A";
   const topScoreValue =
     Number.isFinite(modelTelemetry?.topScoreValue) ?
@@ -122,27 +116,49 @@ function CameraFeed({
 
             {snapshotTaken && (
               <Motion.div
+                key={`snapshot-flash-${snapshotFlashKey}`}
+                initial={{ opacity: 0.56 }}
+                animate={{ opacity: [0.56, 0.24, 0.08, 0] }}
+                transition={{ duration: 0.55, ease: "easeOut" }}
+                className="pointer-events-none absolute inset-0 bg-cyan-100"
+              />
+            )}
+
+            {snapshotTaken && (
+              <Motion.div
+                key={`snapshot-dim-${snapshotFlashKey}`}
+                initial={{ opacity: 0.34 }}
+                animate={{ opacity: [0.34, 0.2, 0] }}
+                transition={{ duration: 0.9, ease: "easeOut" }}
+                className="pointer-events-none absolute inset-0 bg-slate-950"
+              />
+            )}
+
+            {snapshotTaken && (
+              <Motion.div
                 initial={{ opacity: 0, scale: 0.8, y: -8 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 transition={{ duration: 0.18 }}
                 className="absolute left-3 top-3 flex items-center gap-2 rounded-full border border-amber-300/45 bg-amber-950/70 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-100 backdrop-blur-sm lg:text-xs">
                 <span className="h-2 w-2 rounded-full bg-amber-300 shadow-[0_0_10px_rgba(252,211,77,0.95)]" />
-                <span>Snap</span>
+                <svg
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5 text-amber-100"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round">
+                  <path d="M4 8h3l1.6-2h6.8L17 8h3a1 1 0 0 1 1 1v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a1 1 0 0 1 1-1z" />
+                  <circle cx="12" cy="13" r="3.2" />
+                </svg>
+                <span>Captured</span>
                 {!!snapshotReason && (
                   <span className="text-amber-200/80">{snapshotReason}</span>
                 )}
               </Motion.div>
             )}
-
-            <div className="absolute bottom-3 right-3">
-              <button
-                type="button"
-                onClick={onManualSnapshot}
-                disabled={!snapshotReady}
-                className={`rounded-full border px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.16em] backdrop-blur-sm transition ${snapshotReady ? "border-cyan-300/50 bg-cyan-500/15 text-cyan-100 hover:bg-cyan-500/25" : "cursor-not-allowed border-slate-500/35 bg-slate-900/55 text-slate-400"}`}>
-                {manualSnapshotBusy ? "Saving..." : "Take Snap"}
-              </button>
-            </div>
 
             {hasFace === false && (
               <div className="absolute right-3 top-3 rounded-full border border-amber-300/35 bg-amber-950/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-200 backdrop-blur-sm lg:text-xs">
@@ -157,12 +173,6 @@ function CameraFeed({
             <p className="text-xs text-slate-400">
               Turn camera on to resume live detection.
             </p>
-            <button
-              type="button"
-              disabled
-              className="mt-2 cursor-not-allowed rounded-full border border-slate-500/35 bg-slate-900/55 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-              Take Snap
-            </button>
           </div>
         }
 

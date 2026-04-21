@@ -187,8 +187,6 @@ function App() {
               confidence={confidence}
               cameraError={!cameraEnabled ? "" : error}
               modelTelemetry={modelTelemetry}
-              onManualSnapshot={handleManualSnapshot}
-              manualSnapshotBusy={manualSnapshotBusy}
             />
           </div>
 
